@@ -88,6 +88,16 @@ pub(super) struct LspState {
     docs: HashMap<String, Doc>,
     /// (errors, warnings) per file.
     counts: HashMap<String, (usize, usize)>,
+    /// The errors and warnings of each file, in document order, for jumping between them.
+    problems: HashMap<String, Vec<Problem>>,
+}
+
+/// One error or warning, where it starts.
+struct Problem {
+    line: u32,
+    col: u32,
+    error: bool,
+    message: String,
 }
 
 /// The editor's view of one document's server.
@@ -496,6 +506,7 @@ impl Kalem {
             return;
         };
         self.lsp.counts.remove(rel);
+        self.lsp.problems.remove(rel);
         if let Some(server) = self
             .lsp
             .servers
@@ -530,6 +541,24 @@ impl Kalem {
         let count = |sev| list.iter().filter(|d| d.severity == Some(sev)).count();
         let errors = count(kalem_lsp::lsp_types::DiagnosticSeverity::ERROR);
         let warnings = count(kalem_lsp::lsp_types::DiagnosticSeverity::WARNING);
+        let mut problems: Vec<Problem> = list
+            .iter()
+            .filter_map(|d| {
+                let error = match d.severity {
+                    Some(kalem_lsp::lsp_types::DiagnosticSeverity::ERROR) => true,
+                    Some(kalem_lsp::lsp_types::DiagnosticSeverity::WARNING) => false,
+                    _ => return None,
+                };
+                Some(Problem {
+                    line: d.range.start.line,
+                    col: d.range.start.character,
+                    error,
+                    message: d.message.lines().next().unwrap_or("").to_string(),
+                })
+            })
+            .collect();
+        problems.sort_by_key(|p| (p.line, p.col));
+        self.lsp.problems.insert(rel.clone(), problems);
         self.lsp.counts.insert(rel, (errors, warnings));
         editor.update(cx, |e, cx| {
             if let Some(set) = e.diagnostics_mut() {
@@ -560,6 +589,59 @@ impl Kalem {
                 cx.notify();
             }
         }
+    }
+
+    /// (errors, warnings) of a file.
+    pub(super) fn problem_counts(&self, rel: &str) -> (usize, usize) {
+        self.lsp.counts.get(rel).copied().unwrap_or_default()
+    }
+
+    /// Move the cursor to the next (`dir > 0`) or previous error or warning of the current file,
+    /// wrapping round at the ends.
+    pub(super) fn goto_problem(&mut self, dir: i32, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self
+            .active
+            .and_then(|i| self.tabs.get(i))
+            .filter(|t| t.edits_file())
+        else {
+            return;
+        };
+        let editor = tab.editor.clone();
+        let list = self
+            .lsp
+            .problems
+            .get(&tab.path)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        if list.is_empty() {
+            self.status_text = "No errors or warnings in this file".into();
+            cx.notify();
+            return;
+        }
+        let at = editor.read(cx).cursor_position();
+        let here = (at.line, at.character);
+        let key = |p: &Problem| (p.line, p.col);
+        let ix = if dir > 0 {
+            list.iter().position(|p| key(p) > here).unwrap_or(0)
+        } else {
+            list.iter()
+                .rposition(|p| key(p) < here)
+                .unwrap_or(list.len() - 1)
+        };
+        let p = &list[ix];
+        self.status_text = format!(
+            "{} {} of {}: {}",
+            if p.error { "Error" } else { "Warning" },
+            ix + 1,
+            list.len(),
+            p.message
+        );
+        let pos = Position::new(p.line, p.col);
+        editor.update(cx, |e, cx| {
+            e.set_cursor_position(pos, window, cx);
+            e.focus(window, cx);
+        });
+        cx.notify();
     }
 
     /// For the status bar: the server's state and the file's problem counts.

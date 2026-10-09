@@ -3,6 +3,7 @@
 
 pub mod debug;
 pub mod kinds;
+pub mod launch;
 pub mod lsp;
 pub mod search;
 pub mod tasks;
@@ -66,8 +67,47 @@ fn is_solution_file(p: &Path) -> bool {
     )
 }
 
+/// A project file of a language Kalem supports (C#, Rust, Go, Java/Kotlin, JS/TS, Python):
+/// opening it opens its folder.
+fn is_project_file(p: &Path) -> bool {
+    let name = p
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    name.ends_with(".csproj")
+        || matches!(
+            name.as_str(),
+            "cargo.toml"
+                | "go.mod"
+                | "go.work"
+                | "pom.xml"
+                | "build.gradle"
+                | "build.gradle.kts"
+                | "settings.gradle"
+                | "settings.gradle.kts"
+                | "package.json"
+                | "pyproject.toml"
+                | "requirements.txt"
+                | "setup.py"
+        )
+}
+
 impl Workspace {
-    /// Open a folder, or a `.kalem` / `.slnx` / `.sln` file (its folder becomes the root).
+    /// The solution files (`.kalem`, `.slnx`, `.sln`) directly in a folder.
+    pub fn solution_files(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_file() && is_solution_file(&e.path()))
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// Open a folder, or a `.kalem` / `.slnx` / `.sln` file or a project file such as
+    /// `App.csproj`, `Cargo.toml`, `pom.xml`, `go.mod` (its folder becomes the root).
     pub fn open(path: &Path) -> Result<Workspace, OpenError> {
         let meta =
             std::fs::metadata(path).map_err(|e| OpenError(format!("{}: {e}", path.display())))?;
@@ -76,9 +116,11 @@ impl Workspace {
         } else if is_solution_file(path) {
             let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
             (path.parent().unwrap_or(Path::new(".")).to_path_buf(), name)
+        } else if is_project_file(path) {
+            (path.parent().unwrap_or(Path::new(".")).to_path_buf(), None)
         } else {
             return Err(OpenError(format!(
-                "{}: not a folder or solution file",
+                "{}: not a folder, solution or project file",
                 path.display()
             )));
         };
@@ -87,7 +129,8 @@ impl Workspace {
         } else {
             root
         };
-        let solution = kalem_solution::load(&root).map_err(|e| OpenError(e.0))?;
+        let solution = kalem_solution::load_named(&root, solution_file.as_deref())
+            .map_err(|e| OpenError(e.0))?;
         let files = list_files(&root);
         let explorer = Explorer::from_paths(files.iter().map(String::as_str));
         Ok(Workspace {
@@ -287,7 +330,23 @@ pub fn language_for(path: &str) -> Option<&'static str> {
         "html" | "htm" => "html",
         "css" => "css",
         "sh" | "bash" => "bash",
-        "xml" | "slnx" | "csproj" | "props" | "targets" => "html",
+        // Razor has its own grammar (registered by the app); XML-like files read well as HTML.
+        "razor" | "cshtml" => "razor",
+        "xml" | "slnx" | "csproj" | "vbproj" | "fsproj" | "props" | "targets" | "config"
+        | "resx" | "xaml" | "axaml" | "nuspec" | "plist" | "svg" | "xsd" | "xslt" | "wxs"
+        | "vue" => "html",
+        "scss" | "less" => "css",
+        "php" => "php",
+        "rb" => "ruby",
+        "lua" => "lua",
+        "mk" => "make",
+        "cmake" => "cmake",
+        "diff" | "patch" => "diff",
+        "proto" => "proto",
+        "graphql" | "gql" => "graphql",
+        "scala" | "sc" => "scala",
+        "mdx" => "markdown",
+        "zsh" | "ksh" => "bash",
         _ => return None,
     })
 }
@@ -310,6 +369,9 @@ mod tests {
         assert_eq!(language_for("a/B.CS"), Some("csharp"));
         assert_eq!(language_for("x.kalem"), Some("toml"));
         assert_eq!(language_for("Makefile"), Some("make"));
+        assert_eq!(language_for("Pages/Index.razor"), Some("razor"));
+        assert_eq!(language_for("App.csproj"), Some("html"));
+        assert_eq!(language_for("a/b.scss"), Some("css"));
         assert_eq!(language_for("LICENSE"), None);
         assert_eq!(language_for("data.bin"), None);
     }
@@ -353,6 +415,29 @@ mod tests {
         assert_eq!(ws.solution_file.as_deref(), Some("Demo.kalem"));
         assert_eq!(ws.name(), "Demo");
         assert_eq!(ws.project_count(), 1);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_picked_solution_is_used_when_a_folder_has_several() {
+        let d = scratch("two");
+        fs::write(d.join("A.slnx"), "<Solution></Solution>").unwrap();
+        fs::write(d.join("B.slnx"), "<Solution></Solution>").unwrap();
+        assert_eq!(Workspace::solution_files(&d), vec!["A.slnx", "B.slnx"]);
+        let ws = Workspace::open(&d.join("B.slnx")).unwrap();
+        assert_eq!(ws.name(), "B");
+        assert_eq!(ws.solution_file.as_deref(), Some("B.slnx"));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_project_file_opens_its_folder() {
+        let d = scratch("proj");
+        fs::write(d.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        fs::write(d.join("App.csproj"), "<Project/>").unwrap();
+        assert_eq!(Workspace::open(&d.join("Cargo.toml")).unwrap().root, d);
+        assert_eq!(Workspace::open(&d.join("App.csproj")).unwrap().root, d);
+        assert!(Workspace::open(&d.join("notes.txt")).is_err());
         let _ = fs::remove_dir_all(&d);
     }
 

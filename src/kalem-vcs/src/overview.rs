@@ -172,6 +172,101 @@ pub fn badge(st: &Status, path: &str) -> Option<Badge> {
     inside.then_some(Badge::ContainsChanges)
 }
 
+/// One row of the changed-files tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TreeRow {
+    /// A folder; a chain of folders with nothing else in them is shown as one (`src/Pages`).
+    Folder {
+        /// Full path, `/` separated, no trailing slash.
+        path: String,
+        label: String,
+        depth: usize,
+        /// Changed files below it.
+        files: usize,
+        collapsed: bool,
+    },
+    File {
+        path: String,
+        kind: ChangeKind,
+        depth: usize,
+    },
+}
+
+#[derive(Default)]
+struct Dir {
+    dirs: std::collections::BTreeMap<String, Dir>,
+    files: Vec<(String, ChangeKind)>,
+}
+
+impl Dir {
+    fn count(&self) -> usize {
+        self.files.len() + self.dirs.values().map(Dir::count).sum::<usize>()
+    }
+}
+
+/// Changed files as a folder tree: folders first, then files, both sorted. `is_collapsed` says
+/// which folders (by full path) are closed; their content is left out.
+pub fn change_tree(
+    files: &[(String, ChangeKind)],
+    is_collapsed: &dyn Fn(&str) -> bool,
+) -> Vec<TreeRow> {
+    let mut root = Dir::default();
+    for (path, kind) in files {
+        let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+        let Some((_, dirs)) = parts.split_last() else {
+            continue;
+        };
+        let mut cur = &mut root;
+        for d in dirs {
+            cur = cur.dirs.entry((*d).to_string()).or_default();
+        }
+        cur.files.push((path.clone(), *kind));
+    }
+    fn emit(
+        dir: &Dir,
+        prefix: &str,
+        depth: usize,
+        is_collapsed: &dyn Fn(&str) -> bool,
+        out: &mut Vec<TreeRow>,
+    ) {
+        for (name, child) in &dir.dirs {
+            let (mut label, mut full, mut node) = (name.clone(), join(prefix, name), child);
+            while node.files.is_empty() && node.dirs.len() == 1 {
+                let (n, c) = node.dirs.iter().next().expect("one child");
+                label = format!("{label}/{n}");
+                full = join(&full, n);
+                node = c;
+            }
+            let collapsed = is_collapsed(&full);
+            out.push(TreeRow::Folder {
+                path: full.clone(),
+                label,
+                depth,
+                files: node.count(),
+                collapsed,
+            });
+            if !collapsed {
+                emit(node, &full, depth + 1, is_collapsed, out);
+            }
+        }
+        let mut files = dir.files.clone();
+        files.sort_by_key(|f| f.0.to_lowercase());
+        for (path, kind) in files {
+            out.push(TreeRow::File { path, kind, depth });
+        }
+    }
+    fn join(prefix: &str, name: &str) -> String {
+        if prefix.is_empty() {
+            name.to_string()
+        } else {
+            format!("{prefix}/{name}")
+        }
+    }
+    let mut out = Vec::new();
+    emit(&root, "", 0, is_collapsed, &mut out);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,5 +341,42 @@ mod tests {
         assert_eq!(badge(&s, "src/Veto"), Some(Badge::ContainsChanges));
         assert_eq!(badge(&s, "tests"), None);
         assert_eq!(badge(&s, "src/untouched.cs"), None);
+    }
+
+    #[test]
+    fn change_tree_groups_by_folder_and_compacts_chains() {
+        use ChangeKind::{Modified, Untracked};
+        let files = vec![
+            ("README.md".to_string(), Modified),
+            ("src/Veto/Pages/A.razor".to_string(), Modified),
+            ("src/Veto/Pages/B.razor".to_string(), Untracked),
+            ("tests/t.cs".to_string(), Modified),
+        ];
+        let rows = change_tree(&files, &|_| false);
+        let shape: Vec<String> = rows
+            .iter()
+            .map(|r| match r {
+                TreeRow::Folder {
+                    label,
+                    depth,
+                    files,
+                    ..
+                } => format!("{depth}:{label}/ ({files})"),
+                TreeRow::File { path, depth, .. } => format!("{depth}:{path}"),
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                "0:src/Veto/Pages/ (2)",
+                "1:src/Veto/Pages/A.razor",
+                "1:src/Veto/Pages/B.razor",
+                "0:tests/ (1)",
+                "1:tests/t.cs",
+                "0:README.md",
+            ]
+        );
+        let closed = change_tree(&files, &|p| p == "src/Veto/Pages");
+        assert_eq!(closed.len(), 4);
     }
 }

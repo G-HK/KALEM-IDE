@@ -61,6 +61,9 @@ svgs!(
     "label-explorer",
     "label-git",
     "label-find",
+    "circle-x",
+    "triangle-alert",
+    "chevron-up",
 );
 
 pub fn icon(name: &str) -> Icon {

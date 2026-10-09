@@ -442,7 +442,10 @@ impl Live {
                 let (Some(&a), Some(&b)) = (so.get(lo), sn.get(ln)) else {
                     continue;
                 };
-                let line = |t: &str, s: usize| t[s..].split('\n').next().unwrap_or("").to_string();
+                let line = |t: &str, s: usize| {
+                    let l = t[s..].split('\n').next().unwrap_or("");
+                    l.strip_suffix('\r').unwrap_or(l).to_string()
+                };
                 let (ta, tb) = (line(&old, a), line(&new, b));
                 let (ea, eb) = intra(&ta, &tb);
                 for (x, y) in ea {
@@ -536,6 +539,7 @@ fn live_view(
     fg: Hsla,
     muted: Hsla,
     border: Hsla,
+    text_size: Pixels,
 ) -> AnyElement {
     let (add_c, del_c) = (rgba(palette.get("success")), rgba(palette.get("danger")));
     let dark = fg.l > 0.5;
@@ -734,6 +738,7 @@ fn live_view(
                 .relative()
                 .child(
                     Editor::new(&live.left)
+                        .text_size(text_size)
                         .appearance(false)
                         .readonly(true)
                         .h_full(),
@@ -765,7 +770,12 @@ fn live_view(
                 .min_w_0()
                 .h_full()
                 .relative()
-                .child(Editor::new(&live.right).appearance(false).h_full())
+                .child(
+                    Editor::new(&live.right)
+                        .text_size(text_size)
+                        .appearance(false)
+                        .h_full(),
+                )
                 .child(bands(false)),
         );
     div()
@@ -785,9 +795,10 @@ pub(crate) fn diff_view(
     muted: Hsla,
     border: Hsla,
     live_ok: bool,
+    text_size: Pixels,
 ) -> AnyElement {
     if let Some(live) = doc.live.as_ref().filter(|_| live_ok) {
-        return live_view(doc, live, palette, fg, muted, border);
+        return live_view(doc, live, palette, fg, muted, border, text_size);
     }
     let (add_c, del_c) = (rgba(palette.get("success")), rgba(palette.get("danger")));
     let unified = doc.unified.get();

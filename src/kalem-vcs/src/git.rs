@@ -102,6 +102,16 @@ impl GitCli {
             .map(|_| ())
     }
 
+    /// Throw away the unstaged changes of tracked files: they go back to the staged (or committed)
+    /// version. Deleted files come back.
+    pub fn discard(&self, repo: &Path, paths: &[String]) -> Result<(), VcsError> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        self.run_owned(repo, &Self::with_paths(&["restore"], paths))
+            .map(|_| ())
+    }
+
     pub fn stage_all(&self, repo: &Path) -> Result<(), VcsError> {
         self.run_text(repo, &["add", "-A"]).map(|_| ())
     }
@@ -158,6 +168,26 @@ impl GitCli {
                 "300",
             ],
         )
+    }
+
+    /// The history of one file (following renames), one line per commit: hash, date, author, subject.
+    pub fn file_history(&self, repo: &Path, path: &str) -> Result<String, VcsError> {
+        self.run_text(
+            repo,
+            &[
+                "log",
+                "--follow",
+                "--date=short",
+                "--format=%h  %ad  %an  %s",
+                "--",
+                path,
+            ],
+        )
+    }
+
+    /// Who last changed each line of a file: `git blame` with short dates.
+    pub fn blame(&self, repo: &Path, path: &str) -> Result<String, VcsError> {
+        self.run_text(repo, &["blame", "--date=short", "--", path])
     }
 
     /// The staged (index) version of a file, `None` when git does not know the file yet.

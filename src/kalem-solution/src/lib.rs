@@ -174,6 +174,12 @@ pub(crate) fn project_name(path: &str) -> String {
 /// Picks the first `*.kalem`, else `*.slnx`, else `*.sln`, else a workspace manifest.
 /// Returns `Ok(None)` when the folder has no solution definition.
 pub fn load(dir: &Path) -> Result<Option<Solution>, SolutionError> {
+    load_named(dir, None)
+}
+
+/// Like [`load`], but with `file` (a `*.kalem`, `*.slnx` or `*.sln` in `dir`) as the solution
+/// when given: a folder can hold several, and the one the user picked is the one to use.
+pub fn load_named(dir: &Path, file: Option<&str>) -> Result<Option<Solution>, SolutionError> {
     let read = |p: &Path| {
         std::fs::read_to_string(p).map_err(|e| SolutionError(format!("{}: {e}", p.display())))
     };
@@ -189,6 +195,17 @@ pub fn load(dir: &Path) -> Result<Option<Solution>, SolutionError> {
             .map(|(s, _)| s.to_string())
             .unwrap_or_default()
     };
+    if let Some(n) = file.filter(|f| names.contains(&f.to_string())) {
+        let text = read(&dir.join(n))?;
+        let lower = n.to_lowercase();
+        if lower.ends_with(".kalem") {
+            return parse_kalem(&text, &stem(n)).map(Some);
+        } else if lower.ends_with(".slnx") {
+            return parse_slnx(&text, &stem(n)).map(Some);
+        } else if lower.ends_with(".sln") {
+            return parse_sln(&text, &stem(n)).map(Some);
+        }
+    }
     for ext in ["kalem", "slnx", "sln"] {
         if let Some(n) = names
             .iter()

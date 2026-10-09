@@ -255,6 +255,8 @@ pub fn load_all(dir: Option<&Path>) -> (Vec<Theme>, Vec<String>) {
 pub struct Settings {
     pub theme: String,
     pub mode: Mode,
+    /// Editor zoom in percent.
+    pub zoom: u32,
 }
 
 impl Default for Settings {
@@ -262,6 +264,7 @@ impl Default for Settings {
         Settings {
             theme: "Kalem".into(),
             mode: Mode::Dark,
+            zoom: 100,
         }
     }
 }
@@ -276,6 +279,9 @@ impl Settings {
             if let Some(m) = t.get("mode").and_then(|v| v.as_str()).and_then(Mode::parse) {
                 s.mode = m;
             }
+            if let Some(z) = t.get("zoom").and_then(|v| v.as_integer()) {
+                s.zoom = z.clamp(25, 500) as u32;
+            }
         }
         s
     }
@@ -287,6 +293,7 @@ impl Settings {
             "mode".into(),
             toml::Value::String(self.mode.as_str().into()),
         );
+        t.insert("zoom".into(), toml::Value::Integer(self.zoom as i64));
         toml::to_string(&t).unwrap_or_default()
     }
 
@@ -377,10 +384,13 @@ mod tests {
         let s = Settings {
             theme: "Ocean".into(),
             mode: Mode::Light,
+            zoom: 125,
         };
         s.save(Some(&d)).unwrap();
         assert_eq!(Settings::load(Some(&d)), s);
         assert_eq!(Settings::load(None), Settings::default());
+        assert_eq!(Settings::parse("zoom = 9000").zoom, 500);
+        assert_eq!(Settings::parse("").zoom, 100);
         let _ = std::fs::remove_dir_all(&d);
     }
 }

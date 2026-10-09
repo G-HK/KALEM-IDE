@@ -53,6 +53,127 @@ fn sort_tree(node: &mut Node) {
     }
 }
 
+/// Suffix pairs `(dependent, parent)` for files that sit under another file with the same stem:
+/// `site.css` under `site.scss`, `Form1.Designer.cs` under `Form1.cs`, ...
+const PAIRS: &[(&str, &str)] = &[
+    ("css", "scss"),
+    ("min.css", "scss"),
+    ("css", "less"),
+    ("min.css", "less"),
+    ("css.map", "scss"),
+    ("js", "ts"),
+    ("min.js", "ts"),
+    ("js.map", "ts"),
+    ("d.ts", "ts"),
+    ("designer.cs", "cs"),
+    ("designer.vb", "vb"),
+    ("g.cs", "cs"),
+    ("g.i.cs", "cs"),
+    ("generated.cs", "cs"),
+    ("designer.cs", "resx"),
+    ("designer.cs", "settings"),
+    ("designer.cs", "tt"),
+    ("resx", "cs"),
+];
+
+/// Extensions whose `name.<variant>.ext` files sit under `name.ext` (`appsettings.Development.json`).
+const VARIANTS: &[&str] = &["json", "config", "yml", "yaml"];
+
+/// The index of the file each of `names` (files of one folder) nests under, like Visual Studio's
+/// file nesting: `Gauge.razor.cs` and `Gauge.razor.css` under `Gauge.razor`, `Form1.Designer.cs`
+/// under `Form1.cs`, `appsettings.Development.json` under `appsettings.json`, ...
+pub fn nest_files(names: &[&str]) -> Vec<Option<usize>> {
+    let lower: Vec<String> = names.iter().map(|n| n.to_lowercase()).collect();
+    let find = |wanted: &str| lower.iter().position(|n| n == wanted);
+    lower
+        .iter()
+        .enumerate()
+        .map(|(i, n)| {
+            let parent = (|| {
+                // Same stem, related extension.
+                for (dep, par) in PAIRS {
+                    if let Some(stem) = n.strip_suffix(&format!(".{dep}")) {
+                        if let Some(p) = find(&format!("{stem}.{par}")) {
+                            return Some(p);
+                        }
+                    }
+                }
+                // `A.B.C` under `A.B` (`.razor.cs`, `.xaml.cs`, `.cshtml.cs`, `.razor.css`, ...).
+                if let Some((stem, _)) = n.rsplit_once('.') {
+                    if !stem.is_empty() {
+                        if let Some(p) = find(stem) {
+                            return Some(p);
+                        }
+                    }
+                }
+                // `name.variant.json` under `name.json`.
+                let (rest, ext) = n.rsplit_once('.')?;
+                if VARIANTS.contains(&ext) {
+                    let (base, _) = rest.rsplit_once('.')?;
+                    return find(&format!("{base}.{ext}"));
+                }
+                None
+            })();
+            parent.filter(|&p| p != i)
+        })
+        .collect()
+}
+
+impl Node {
+    /// This folder's tree with nested files grouped under their parent file (see [`nest_files`]);
+    /// a file that has others under it carries them as `children`.
+    pub fn nested(&self) -> Node {
+        let files: Vec<usize> = (0..self.children.len())
+            .filter(|&i| !self.children[i].is_dir)
+            .collect();
+        let names: Vec<&str> = files
+            .iter()
+            .map(|&i| self.children[i].name.as_str())
+            .collect();
+        let parents = nest_files(&names);
+        // Guard against loops: a file whose chain of parents comes back to itself stays flat.
+        let looped = |mut k: usize| {
+            for _ in 0..=names.len() {
+                match parents[k] {
+                    Some(p) => k = p,
+                    None => return false,
+                }
+            }
+            true
+        };
+        let parent_of: Vec<Option<usize>> = (0..names.len())
+            .map(|k| if looped(k) { None } else { parents[k] })
+            .collect();
+        fn build(node: &Node, files: &[usize], parent_of: &[Option<usize>], k: usize) -> Node {
+            let mut n = node.children[files[k]].clone();
+            n.children = (0..files.len())
+                .filter(|&c| parent_of[c] == Some(k))
+                .map(|c| build(node, files, parent_of, c))
+                .collect();
+            n
+        }
+        let mut children: Vec<Node> = Vec::new();
+        for (i, c) in self.children.iter().enumerate() {
+            if c.is_dir {
+                children.push(c.nested());
+            } else if let Some(k) = files.iter().position(|&f| f == i) {
+                if parent_of[k].is_none() {
+                    children.push(build(self, &files, &parent_of, k));
+                }
+            }
+        }
+        Node {
+            children,
+            ..self.clone()
+        }
+    }
+
+    /// Whether this is a file with other files nested under it.
+    pub fn is_nest_parent(&self) -> bool {
+        !self.is_dir && !self.children.is_empty()
+    }
+}
+
 impl Explorer {
     /// Build the tree from file paths relative to the project root (either slash style).
     pub fn from_paths<I, S>(paths: I) -> Self
@@ -248,5 +369,68 @@ mod tests {
     fn stats_count_folders_and_files() {
         let s = sample().stats();
         assert_eq!((s.folders, s.files), (7, 8));
+    }
+
+    #[test]
+    fn razor_and_xaml_files_nest_under_their_component() {
+        let n = nest_files(&[
+            "Gauge.razor",
+            "Gauge.razor.cs",
+            "Gauge.razor.css",
+            "Other.razor",
+        ]);
+        assert_eq!(n, vec![None, Some(0), Some(0), None]);
+        let n = nest_files(&["Main.xaml", "Main.xaml.cs"]);
+        assert_eq!(n, vec![None, Some(0)]);
+    }
+
+    #[test]
+    fn designer_and_variant_files_nest() {
+        let n = nest_files(&["Form1.cs", "Form1.Designer.cs", "Form1.resx"]);
+        assert_eq!(n, vec![None, Some(0), Some(0)]);
+        let n = nest_files(&[
+            "appsettings.json",
+            "appsettings.Development.json",
+            "other.json",
+        ]);
+        assert_eq!(n, vec![None, Some(0), None]);
+        let n = nest_files(&["site.scss", "site.css", "site.min.css", "site.css.map"]);
+        assert_eq!(n, vec![None, Some(0), Some(0), Some(0)]);
+    }
+
+    #[test]
+    fn unrelated_files_stay_flat() {
+        let n = nest_files(&[
+            "README.md",
+            "main.rs",
+            "lib.rs",
+            "Cargo.toml",
+            "x.cs",
+            "y.cs",
+        ]);
+        assert!(n.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn nested_tree_groups_children_and_recurses() {
+        let e = Explorer::from_paths([
+            "src/Pages/Gauge.razor",
+            "src/Pages/Gauge.razor.cs",
+            "src/Pages/Gauge.razor.css",
+            "src/Pages/Plain.cs",
+        ]);
+        let t = e.root.nested();
+        let pages = &t.children[0].children[0];
+        let names: Vec<_> = pages.children.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["Gauge.razor", "Plain.cs"]);
+        let g = &pages.children[0];
+        assert!(g.is_nest_parent());
+        let kids: Vec<_> = g.children.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(kids, vec!["Gauge.razor.cs", "Gauge.razor.css"]);
+        // the flat tree is untouched, so lookups keep working
+        assert_eq!(
+            e.find("src/Pages/Gauge.razor.cs").unwrap().name,
+            "Gauge.razor.cs"
+        );
     }
 }

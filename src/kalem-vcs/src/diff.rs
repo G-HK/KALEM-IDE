@@ -191,9 +191,23 @@ pub struct LineChange {
 }
 
 /// The line-level differences between two texts, in order.
+///
+/// Lines are what an editor shows: the text split at `\n` (so a final newline leaves an empty
+/// last line), without a trailing `\r`. A file with CRLF line endings therefore compares equal
+/// to the same text with LF endings, and only the lines that really differ are reported.
 pub fn line_changes(old: &str, new: &str) -> Vec<LineChange> {
     use similar::{DiffTag, TextDiff};
-    TextDiff::from_lines(old, new)
+    let lines = |t: &str| -> Vec<String> {
+        t.split('\n')
+            .map(|l| l.strip_suffix('\r').unwrap_or(l).to_string())
+            .collect()
+    };
+    let (a, b) = (lines(old), lines(new));
+    let (a, b): (Vec<&str>, Vec<&str>) = (
+        a.iter().map(String::as_str).collect(),
+        b.iter().map(String::as_str).collect(),
+    );
+    TextDiff::from_slices(&a, &b)
         .ops()
         .iter()
         .filter_map(|op| {
@@ -361,6 +375,31 @@ mod changed_words_tests {
 #[cfg(test)]
 mod line_changes_tests {
     use super::*;
+
+    #[test]
+    fn line_endings_do_not_count_as_changes() {
+        assert!(line_changes("a\r\nb\r\n", "a\nb\n").is_empty());
+        // Only the edited line differs, though one text is CRLF and the other LF.
+        assert_eq!(
+            line_changes("a\r\nb\r\nc\r\n", "a\nbx\nc\n"),
+            vec![LineChange {
+                old: 1..2,
+                new: 1..2
+            }]
+        );
+    }
+
+    #[test]
+    fn a_missing_final_newline_is_only_the_empty_last_line() {
+        // Like the editor: "a\nb\n" has an empty line 3, "a\nb" has none.
+        assert_eq!(
+            line_changes("a\nb\n", "a\nb"),
+            vec![LineChange {
+                old: 2..3,
+                new: 2..2
+            }]
+        );
+    }
 
     #[test]
     fn five_lines_become_one() {

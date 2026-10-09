@@ -1,7 +1,11 @@
-use crate::detached::{dest_at, mouse_up_probe, tab_strip, Detached, StripCtx, TabHost};
+use crate::detached::{
+    closable, dest_at, drag_overlay, drag_probe, end_drag, gap_at, mouse_up_probe, tab_strip,
+    toggle_pin, wheel_zoom_probe, Detached, StripCtx, TabHost, TabOp,
+};
 use crate::diffview::{diff_view, DiffDoc, Live};
 use crate::icons::icon;
 use crate::theming::{self, rgba};
+use crate::zoom;
 use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
     checkbox::Checkbox,
@@ -9,7 +13,7 @@ use gpui_kit::component::{
         self, Editor, EditorState, Input, InputEvent, InputState, Position, Textarea, TextareaState,
     },
     list::ListItem,
-    menu::DropdownMenu as _,
+    menu::{ContextMenuExt as _, DropdownMenu as _},
     resizable::{h_resizable, resizable_panel, v_resizable},
     tree::{tree, TreeItem, TreeState},
     ActiveTheme as _, Disableable as _,
@@ -21,9 +25,10 @@ use kalem_test::{Outcome, TestRun};
 use kalem_theme::{Mode, Palette, Settings, Theme as KalemTheme};
 use kalem_vcs::diff::DiffRow;
 use kalem_vcs::git::{Branch, GitCli, Stash};
-use kalem_vcs::overview::ChangesOverview;
+use kalem_vcs::overview::{change_tree, ChangesOverview, TreeRow};
 use kalem_vcs::{ChangeKind, Status, VcsError};
 use kalem_workspace::kinds::{badge_for, is_image, project_index, project_kind, ProjectKind};
+use kalem_workspace::launch::Profile;
 use kalem_workspace::search::{
     matches_file_types, replace_in_files, search, SearchOptions, SearchResult,
 };
@@ -46,6 +51,12 @@ actions!(
         FindReferences,
         RenameSymbol,
         FormatDocument,
+        NextProblem,
+        PrevProblem,
+        ZoomIn,
+        ZoomOut,
+        ZoomReset,
+        ConfigureProfiles,
         CloseRename,
         StartDebugging,
         StopDebugging,
@@ -56,7 +67,9 @@ actions!(
         ToggleBreakpoint,
         Save,
         OpenFolder,
+        OpenSolution,
         CloseTab,
+        RestoreTab,
         Quit,
         ToggleSync,
         Refresh,
@@ -116,6 +129,16 @@ pub struct AutoHideRight(pub usize);
 #[derive(Clone, PartialEq, Action)]
 #[action(namespace = kalem, no_json)]
 pub struct SetFindScope(pub usize);
+
+/// Pick what the Run button runs: 0 is the default, `n` the n-th run profile.
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = kalem, no_json)]
+pub struct SetProfile(pub usize);
+
+/// Editor zoom, in percent.
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = kalem, no_json)]
+pub struct SetZoom(pub usize);
 
 /// Where the Find and Replace window currently lives.
 #[derive(Clone, Copy, PartialEq)]
@@ -193,6 +216,8 @@ fn guide_at(size: Size<Pixels>, pos: Point<Pixels>) -> Option<Guide> {
 enum GitOp {
     Stage(Vec<String>),
     Unstage(Vec<String>),
+    /// Undo the unstaged changes of tracked files.
+    Discard(Vec<String>),
     StageAll,
     UnstageAll,
     Commit {
@@ -207,6 +232,9 @@ enum GitOp {
     Sync,
     /// Print the commit graph in the Output panel.
     Log,
+    /// Print the history of one file / who changed each line of it.
+    History(String),
+    Blame(String),
     Checkout(String),
     StashPush,
     StashPop(String),
@@ -219,6 +247,7 @@ fn run_git_op(root: &Path, op: &GitOp) -> Result<String, VcsError> {
     match op {
         GitOp::Stage(p) => none(git.stage(root, p)),
         GitOp::Unstage(p) => none(git.unstage(root, p)),
+        GitOp::Discard(p) => none(git.discard(root, p)),
         GitOp::StageAll => none(git.stage_all(root)),
         GitOp::UnstageAll => none(git.unstage_all(root)),
         GitOp::Commit {
@@ -240,6 +269,8 @@ fn run_git_op(root: &Path, op: &GitOp) -> Result<String, VcsError> {
             Ok(format!("{pulled}\n{pushed}").trim().to_string())
         }
         GitOp::Log => git.log(root),
+        GitOp::History(p) => git.file_history(root, p),
+        GitOp::Blame(p) => git.blame(root, p),
         GitOp::Checkout(b) => git.checkout(root, b),
         GitOp::StashPush => git.stash_push(root, ""),
         GitOp::StashPop(n) => git.stash_pop(root, n),
@@ -257,7 +288,9 @@ pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("secondary-s", Save, None),
         KeyBinding::new("secondary-o", OpenFolder, None),
+        KeyBinding::new("secondary-shift-o", OpenSolution, None),
         KeyBinding::new("secondary-w", CloseTab, None),
+        KeyBinding::new("secondary-shift-t", RestoreTab, None),
         KeyBinding::new("secondary-shift-b", Build, None),
         KeyBinding::new("ctrl-f5", RunNoDebug, None),
         KeyBinding::new("secondary-p", QuickOpen, None),
@@ -266,6 +299,12 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("shift-f12", FindReferences, None),
         KeyBinding::new("f2", RenameSymbol, None),
         KeyBinding::new("shift-alt-f", FormatDocument, None),
+        KeyBinding::new("f8", NextProblem, None),
+        KeyBinding::new("shift-f8", PrevProblem, None),
+        KeyBinding::new("secondary-=", ZoomIn, None),
+        KeyBinding::new("secondary-+", ZoomIn, None),
+        KeyBinding::new("secondary--", ZoomOut, None),
+        KeyBinding::new("secondary-0", ZoomReset, None),
         KeyBinding::new("escape", CloseRename, Some("Rename")),
         KeyBinding::new("shift-f3", FindPrev, None),
         KeyBinding::new("alt-left", NavBack, None),
@@ -294,6 +333,10 @@ pub(crate) struct OpenTab {
     pub diff: Option<Rc<DiffDoc>>,
     /// Breakpoint / current-line highlights, created when first needed.
     pub marks: Option<debugger::Marks>,
+    /// Pinned tabs sit at the left and stay when the others are closed.
+    pub pinned: bool,
+    /// A tab colour picked by the user (1..=8 of the theme's tab colours) instead of the project's.
+    pub color: Option<u8>,
 }
 
 impl OpenTab {
@@ -304,7 +347,7 @@ impl OpenTab {
 }
 
 /// Where a tab is moved to.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Dest {
     /// A fresh window.
     New,
@@ -318,6 +361,33 @@ pub(crate) enum Dest {
 #[derive(Clone, PartialEq, Action)]
 #[action(namespace = kalem, no_json)]
 pub(crate) struct MoveTab(pub usize, pub Dest);
+
+/// What a file's right-click menu in Git Changes does.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum GitFileOp {
+    Open,
+    Stage,
+    Unstage,
+    History,
+    Compare,
+    Blame,
+    /// Undo the changes of a file (an untracked file is deleted).
+    Discard,
+    Delete,
+    IgnoreItem,
+    IgnoreExtension,
+}
+
+/// A command from the right-click menu of a file in Git Changes: path, command, whether the
+/// row is in the staged list, whether git does not know the file yet.
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = kalem, no_json)]
+pub(crate) struct GitFileCmd(pub String, pub GitFileOp, pub bool, pub bool);
+
+/// A command from a tab's (or the tab strip's) context menu.
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = kalem, no_json)]
+pub(crate) struct TabCmd(pub usize, pub TabOp);
 
 /// A torn-off editor window known to the main window.
 struct WinRef {
@@ -429,10 +499,19 @@ pub struct Kalem {
     palette: Palette,
     // explorer decoration
     proj_kinds: Rc<HashMap<String, ProjectKind>>,
+    /// Folders closed in the Git Changes tree (`s:` staged list, `c:` changes list + path).
+    chg_collapsed: std::collections::HashSet<String>,
+    /// Files that have other files nested under them in the explorer.
+    nest_parents: Rc<std::collections::HashSet<String>>,
     changes: Rc<HashMap<String, ChangeKind>>,
     // build / run / test
     config: Config,
     startup: Option<String>,
+    /// Run profiles of `.kalem-ide/launch.toml`, the selected one (`None`: the default) and what
+    /// the default would run.
+    profiles: Vec<Profile>,
+    profile_sel: Option<String>,
+    run_default: Option<String>,
     task: Option<TaskState>,
     task_gen: u64,
     output: Vec<String>,
@@ -478,6 +557,8 @@ pub struct Kalem {
     windows: Vec<WinRef>,
     next_win: u64,
     tab_drag: Option<usize>,
+    /// Files whose tabs were closed, newest last (Reopen Closed Tab).
+    closed_tabs: Vec<String>,
     // debugging
     dbg: Option<debugger::DebugState>,
     dbg_gen: u64,
@@ -507,12 +588,19 @@ const MAX_FIND_HITS: usize = 1000;
 fn tree_items(ws: &Workspace) -> Vec<TreeItem> {
     fn conv(n: &Node) -> TreeItem {
         let mut it = TreeItem::new(n.path.clone(), n.name.clone());
-        if n.is_dir {
+        if !n.children.is_empty() {
             it = it.children(n.children.iter().map(conv));
         }
         it
     }
-    ws.explorer.root.children.iter().map(conv).collect()
+    // Files nest under their parent file like in Visual Studio (`X.razor` > `X.razor.cs`).
+    ws.explorer
+        .root
+        .nested()
+        .children
+        .iter()
+        .map(conv)
+        .collect()
 }
 
 impl Kalem {
@@ -613,9 +701,14 @@ impl Kalem {
             dark: true,
             palette: Palette::default(),
             proj_kinds: Rc::new(HashMap::new()),
+            chg_collapsed: std::collections::HashSet::new(),
+            nest_parents: Rc::new(std::collections::HashSet::new()),
             changes: Rc::new(HashMap::new()),
             config: Config::Debug,
             startup: None,
+            profiles: Vec::new(),
+            profile_sel: None,
+            run_default: None,
             task: None,
             task_gen: 0,
             output: Vec::new(),
@@ -644,6 +737,7 @@ impl Kalem {
             windows: Vec::new(),
             next_win: 2,
             tab_drag: None,
+            closed_tabs: Vec::new(),
             dbg: None,
             dbg_gen: 0,
             pending_debug: None,
@@ -668,6 +762,7 @@ impl Kalem {
             find_scroll: ScrollHandle::new(),
             _find_subs: find_subs,
         };
+        zoom::set(me.settings.zoom, cx);
         me.apply_theme(cx);
         if let Some(p) = start {
             me.open_path(&p, window, cx);
@@ -708,6 +803,107 @@ impl Kalem {
         self.settings.mode = mode;
         self.save_settings();
         self.apply_theme(cx);
+    }
+
+    /// Set the editor zoom (percent) for every editor and remember it.
+    pub(crate) fn set_zoom(&mut self, percent: u32, cx: &mut Context<Self>) {
+        let percent = zoom::clamp(percent);
+        zoom::set(percent, cx);
+        self.settings.zoom = percent;
+        self.save_settings();
+        cx.notify();
+    }
+
+    /// The strip under the editor: zoom, problem counts, previous / next problem.
+    fn editor_bar(
+        &self,
+        fg: Hsla,
+        muted: Hsla,
+        border: Hsla,
+        cx: &mut Context<Self>,
+    ) -> Option<Div> {
+        let tab = self
+            .active
+            .and_then(|i| self.tabs.get(i))
+            .filter(|t| t.edits_file())?;
+        let (errors, warnings) = self.problem_counts(&tab.path);
+        let (danger, warning) = (
+            rgba(self.palette.get("danger")),
+            rgba(self.palette.get("warning")),
+        );
+        let percent = self.settings.zoom;
+        let count = |name: &'static str, n: usize, on: Hsla| {
+            let c = if n > 0 { on } else { muted };
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .text_color(c)
+                .child(icon(name).w(px(14.)).h(px(14.)))
+                .child(n.to_string())
+        };
+        let step = |id: &'static str, ic: &'static str, tip: &'static str, dir: i32| {
+            Button::new(id)
+                .ghost()
+                .compact()
+                .icon(icon(ic))
+                .tooltip(tip)
+                .disabled(errors + warnings == 0)
+                .on_click(cx.listener(move |this, _, w, cx| this.goto_problem(dir, w, cx)))
+        };
+        Some(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_2()
+                .h(px(26.))
+                .flex_none()
+                .border_t_1()
+                .border_color(border)
+                .text_xs()
+                .text_color(fg)
+                .child(
+                    Button::new("zoom")
+                        .ghost()
+                        .compact()
+                        .tooltip("Zoom (Ctrl+= / Ctrl+-)")
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .child(format!("{percent} %"))
+                                .child(icon("chevron-down").w(px(12.)).h(px(12.))),
+                        )
+                        .dropdown_menu(move |mut m, _, _| {
+                            for l in zoom::LEVELS {
+                                m = m.menu_with_check(
+                                    format!("{l} %"),
+                                    l == percent,
+                                    Box::new(SetZoom(l as usize)),
+                                );
+                            }
+                            m.separator().menu("Reset (Ctrl+0)", Box::new(ZoomReset))
+                        }),
+                )
+                .child(div().w(px(1.)).h(px(14.)).bg(border))
+                .child(count("circle-x", errors, danger))
+                .child(count("triangle-alert", warnings, warning))
+                .child(div().w(px(1.)).h(px(14.)).bg(border))
+                .child(step(
+                    "problem-prev",
+                    "arrow-up",
+                    "Previous Error or Warning (Shift+F8)",
+                    -1,
+                ))
+                .child(step(
+                    "problem-next",
+                    "arrow-down",
+                    "Next Error or Warning (F8)",
+                    1,
+                )),
+        )
     }
 
     fn open_themes_folder(&mut self, cx: &mut Context<Self>) {
@@ -755,6 +951,15 @@ impl Kalem {
                     .collect();
                 self.proj_dirs = ws.project_dirs().into_iter().collect();
                 self.proj_kinds = Rc::new(kinds);
+                fn parents(n: &Node, out: &mut std::collections::HashSet<String>) {
+                    if n.is_nest_parent() {
+                        out.insert(n.path.clone());
+                    }
+                    n.children.iter().for_each(|c| parents(c, out));
+                }
+                let mut nest = std::collections::HashSet::new();
+                parents(&ws.explorer.root.nested(), &mut nest);
+                self.nest_parents = Rc::new(nest);
                 self.startup = ws.default_startup();
                 self.ws = Some(ws);
                 self.tabs.clear();
@@ -786,8 +991,44 @@ impl Kalem {
             }
             self.changes = Rc::new(map);
         }
+        self.reload_profiles();
         self.reload_diffs();
         cx.notify();
+    }
+
+    /// Read the run profiles again, and what the default would run.
+    fn reload_profiles(&mut self) {
+        let Some(ws) = &self.ws else { return };
+        let (profiles, error) = ws.profiles();
+        self.profiles = profiles;
+        if let Some(e) = error {
+            self.message = Some(e);
+        }
+        if let Some(sel) = &self.profile_sel {
+            if !self.profiles.iter().any(|p| &p.name == sel) {
+                self.profile_sel = None;
+            }
+        }
+        let startup = self.startup.clone().or_else(|| ws.default_startup());
+        self.run_default = ws.default_run_line(startup.as_deref(), self.config);
+    }
+
+    /// The selected run profile, if it is not the default.
+    fn selected_profile(&self) -> Option<&Profile> {
+        let sel = self.profile_sel.as_ref()?;
+        self.profiles.iter().find(|p| &p.name == sel)
+    }
+
+    /// Open `.kalem-ide/launch.toml`, creating it with an explanation when it is missing.
+    fn configure_profiles(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ws) = &self.ws else { return };
+        match ws.ensure_launch_file() {
+            Ok(rel) => self.open_file(rel, window, cx),
+            Err(e) => {
+                self.message = Some(e);
+                cx.notify();
+            }
+        }
     }
 
     /// Run a git write operation on a background thread, then refresh the panel.
@@ -808,7 +1049,11 @@ impl Kalem {
         let is_commit = matches!(op, GitOp::Commit { .. });
         let quiet = matches!(
             op,
-            GitOp::Stage(_) | GitOp::Unstage(_) | GitOp::StageAll | GitOp::UnstageAll
+            GitOp::Stage(_)
+                | GitOp::Unstage(_)
+                | GitOp::Discard(_)
+                | GitOp::StageAll
+                | GitOp::UnstageAll
         );
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
@@ -871,6 +1116,133 @@ impl Kalem {
         .detach();
     }
 
+    /// A command from the right-click menu of a changed file.
+    fn git_file_op(
+        &mut self,
+        path: &str,
+        op: GitFileOp,
+        staged: bool,
+        untracked: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let one = vec![path.to_string()];
+        match op {
+            GitFileOp::Open => self.open_file(path, window, cx),
+            GitFileOp::Stage => self.git_op("stage", GitOp::Stage(one), window, cx),
+            GitFileOp::Unstage => self.git_op("stage", GitOp::Unstage(one), window, cx),
+            GitFileOp::Compare => self.open_diff(path, staged, untracked, window, cx),
+            GitFileOp::History => {
+                self.bottom = Bottom::Output;
+                self.git_op("log", GitOp::History(path.to_string()), window, cx);
+            }
+            GitFileOp::Blame => {
+                self.bottom = Bottom::Output;
+                self.git_op("blame", GitOp::Blame(path.to_string()), window, cx);
+            }
+            GitFileOp::IgnoreItem => self.add_to_gitignore(&format!("/{}", path), cx),
+            GitFileOp::IgnoreExtension => {
+                let name = path
+                    .trim_end_matches('/')
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(path);
+                match name.rsplit_once('.').filter(|(stem, _)| !stem.is_empty()) {
+                    Some((_, ext)) => self.add_to_gitignore(&format!("*.{ext}"), cx),
+                    None => self.message = Some(format!("{name} has no extension")),
+                }
+            }
+            GitFileOp::Discard if untracked => {
+                self.git_file_op(path, GitFileOp::Delete, staged, untracked, window, cx)
+            }
+            GitFileOp::Discard => {
+                let name = path.trim_end_matches('/').to_string();
+                let answer = window.prompt(
+                    PromptLevel::Warning,
+                    &format!("Undo changes to {name}?"),
+                    Some("The changes in the working tree are lost. This cannot be undone."),
+                    &["Undo Changes", "Cancel"],
+                    cx,
+                );
+                cx.spawn_in(window, async move |this, cx| {
+                    if answer.await == Ok(0) {
+                        let _ = this.update_in(cx, |this, window, cx| {
+                            this.git_op("undo", GitOp::Discard(vec![name]), window, cx)
+                        });
+                    }
+                })
+                .detach();
+            }
+            GitFileOp::Delete => {
+                let name = path.trim_end_matches('/').to_string();
+                let answer = window.prompt(
+                    PromptLevel::Warning,
+                    &format!("Delete {name}?"),
+                    Some(if untracked {
+                        "git does not know this file yet: it cannot be recovered."
+                    } else {
+                        "The file is removed from disk; git shows it as deleted."
+                    }),
+                    &["Delete", "Cancel"],
+                    cx,
+                );
+                let path = path.to_string();
+                cx.spawn_in(window, async move |this, cx| {
+                    if answer.await == Ok(0) {
+                        let _ = this.update_in(cx, |this, _, cx| this.delete_path(&path, cx));
+                    }
+                })
+                .detach();
+            }
+        }
+    }
+
+    /// Append a pattern to the project's `.gitignore` (once), then show the new status.
+    fn add_to_gitignore(&mut self, pattern: &str, cx: &mut Context<Self>) {
+        let Some(ws) = &self.ws else { return };
+        let file = ws.root.join(".gitignore");
+        let mut text = std::fs::read_to_string(&file).unwrap_or_default();
+        if text.lines().any(|l| l.trim() == pattern) {
+            self.message = Some(format!("{pattern} is already in .gitignore"));
+        } else {
+            if !text.is_empty() && !text.ends_with('\n') {
+                text.push('\n');
+            }
+            text.push_str(pattern);
+            text.push('\n');
+            match std::fs::write(&file, text) {
+                Ok(()) => self.message = Some(format!("Added {pattern} to .gitignore")),
+                Err(e) => self.message = Some(format!(".gitignore: {e}")),
+            }
+        }
+        self.refresh(cx);
+    }
+
+    /// Remove a file (or an untracked folder) from disk and close its tabs.
+    fn delete_path(&mut self, rel: &str, cx: &mut Context<Self>) {
+        let Some(ws) = &self.ws else { return };
+        let target = ws.root.join(rel.trim_end_matches('/'));
+        let res = if target.is_dir() {
+            std::fs::remove_dir_all(&target)
+        } else {
+            std::fs::remove_file(&target)
+        };
+        match res {
+            Ok(()) => {
+                let prefix = rel.trim_end_matches('/');
+                while let Some(ix) = self.tabs.iter().position(|t| {
+                    t.diff.is_none()
+                        && (t.path == prefix || t.path.starts_with(&format!("{prefix}/")))
+                }) {
+                    self.close_tab(ix, cx);
+                }
+                self.message = Some(format!("Deleted {prefix}"));
+            }
+            Err(e) => self.message = Some(format!("Could not delete {rel}: {e}")),
+        }
+        self.refresh(cx);
+    }
+
     fn set_amend(&mut self, on: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.amend = on;
         // Like Visual Studio: amending prefills the previous message.
@@ -900,12 +1272,30 @@ impl Kalem {
         self.git_op("commit", op, window, cx);
     }
 
+    /// "Open Folder...": the system dialog only offers folders (it cannot mix them with files).
     fn pick_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.pick_path(false, window, cx);
+    }
+
+    /// "Open Solution or Project File...": choose a `.sln`, `.slnx`, `.kalem`, `.csproj`,
+    /// `Cargo.toml`, `pom.xml`, `go.mod`, ... file; its folder is opened.
+    fn pick_solution(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.pick_path(true, window, cx);
+    }
+
+    fn pick_path(&mut self, files: bool, window: &mut Window, cx: &mut Context<Self>) {
         let rx = cx.prompt_for_paths(PathPromptOptions {
-            files: true,
-            directories: true,
+            files,
+            directories: !files,
             multiple: false,
-            prompt: Some("Open folder or solution".into()),
+            prompt: Some(
+                if files {
+                    "Open solution or project"
+                } else {
+                    "Open folder"
+                }
+                .into(),
+            ),
         });
         cx.spawn_in(window, async move |this, cx| {
             if let Ok(Ok(Some(paths))) = rx.await {
@@ -974,6 +1364,8 @@ impl Kalem {
             _sub: sub,
             diff: None,
             marks: None,
+            pinned: false,
+            color: None,
         });
         self.message = None;
         self.activate(self.tabs.len() - 1, cx);
@@ -1112,6 +1504,8 @@ impl Kalem {
             _sub: sub,
             diff: Some(doc),
             marks: None,
+            pinned: false,
+            color: None,
         });
         self.activate(self.tabs.len() - 1, cx);
     }
@@ -1566,7 +1960,130 @@ impl Kalem {
         if ix < self.tabs.len() {
             let tab = self.remove_tab(ix, cx);
             if tab.diff.is_none() {
+                self.closed_tabs.retain(|p| *p != tab.path);
+                self.closed_tabs.push(tab.path.clone());
+                if self.closed_tabs.len() > 30 {
+                    self.closed_tabs.remove(0);
+                }
                 self.lsp_forget(&tab.path, cx);
+            }
+        }
+    }
+
+    /// Open the file whose tab was closed last.
+    pub(crate) fn restore_closed_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.restore_closed(window, cx);
+    }
+
+    pub(crate) fn window_handle(&self) -> AnyWindowHandle {
+        self.handle
+    }
+
+    /// All of these tabs into one new window.
+    pub(crate) fn deliver_all(&mut self, tabs: Vec<OpenTab>, cx: &mut Context<Self>) {
+        if !tabs.is_empty() {
+            self.open_detached(tabs, None, cx);
+        }
+    }
+
+    fn restore_closed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        while let Some(path) = self.closed_tabs.pop() {
+            if self
+                .ws
+                .as_ref()
+                .is_some_and(|w| w.root.join(&path).is_file())
+            {
+                self.open_file(&path, window, cx);
+                return;
+            }
+        }
+    }
+
+    pub(crate) fn can_restore_tab(&self) -> bool {
+        !self.closed_tabs.is_empty()
+    }
+
+    /// The file's full path on disk.
+    pub(crate) fn abs_path(&self, rel: &str) -> Option<String> {
+        let ws = self.ws.as_ref()?;
+        Some(ws.root.join(rel).to_string_lossy().to_string())
+    }
+
+    /// "Locate in Solution Explorer": show the explorer with the file selected.
+    pub(crate) fn locate_in_explorer(&mut self, path: &str, cx: &mut Context<Self>) {
+        let Some(ws) = &self.ws else { return };
+        if let Some(plan) = ws.reveal(path) {
+            let id: SharedString = plan.select.into();
+            self.reveal_right(Right::Explorer);
+            self.tree.update(cx, |t, cx| {
+                t.reveal_item(&id, ScrollStrategy::Center, cx);
+                if let Some(i) = t.index_of(&id) {
+                    t.set_selected_index(Some(i), cx);
+                }
+            });
+            cx.notify();
+        }
+    }
+
+    /// Put a tab menu command into effect for a tab of this (the main) window.
+    fn run_tab_op(&mut self, ix: usize, op: TabOp, window: &mut Window, cx: &mut Context<Self>) {
+        let path = self.tabs.get(ix).map(|t| t.path.clone());
+        match op {
+            TabOp::Save => {
+                if ix < self.tabs.len() {
+                    self.activate(ix, cx);
+                    self.save(cx);
+                }
+            }
+            TabOp::Close => self.close_tab(ix, cx),
+            TabOp::CloseOthers => {
+                for i in closable(&self.tabs, Some(ix)) {
+                    self.close_tab(i, cx);
+                }
+            }
+            TabOp::CloseAll => {
+                for i in closable(&self.tabs, None) {
+                    self.close_tab(i, cx);
+                }
+            }
+            TabOp::Restore => self.restore_closed(window, cx),
+            TabOp::ToNewWindow => self.move_tab(ix, Dest::New, None, None, cx),
+            TabOp::AllToNewWindow => {
+                if !self.tabs.is_empty() {
+                    let n = self.tabs.len();
+                    let mut tabs = Vec::with_capacity(n);
+                    for _ in 0..n {
+                        tabs.push(self.remove_tab(0, cx));
+                    }
+                    self.open_detached(tabs, None, cx);
+                }
+            }
+            TabOp::Pin => {
+                if ix < self.tabs.len() {
+                    toggle_pin(&mut self.tabs, ix, &mut self.active);
+                    cx.notify();
+                }
+            }
+            TabOp::Color(c) => {
+                if let Some(t) = self.tabs.get_mut(ix) {
+                    t.color = c;
+                    cx.notify();
+                }
+            }
+            TabOp::Locate => {
+                if let Some(p) = path {
+                    self.locate_in_explorer(&p, cx);
+                }
+            }
+            TabOp::CopyPath => {
+                if let Some(abs) = path.and_then(|p| self.abs_path(&p)) {
+                    cx.write_to_clipboard(ClipboardItem::new_string(abs));
+                }
+            }
+            TabOp::Reveal => {
+                if let Some(abs) = path.and_then(|p| self.abs_path(&p)) {
+                    cx.reveal_path(Path::new(&abs));
+                }
             }
         }
     }
@@ -1672,10 +2189,36 @@ impl Kalem {
     }
 
     /// Take ownership of a tab (re-attaches its dirty tracking to this window).
-    pub(crate) fn adopt(&mut self, mut tab: OpenTab, cx: &mut Context<Self>) {
+    pub(crate) fn adopt(&mut self, tab: OpenTab, cx: &mut Context<Self>) {
+        self.adopt_at(tab, None, cx);
+    }
+
+    /// Like [`Self::adopt`], placing the tab in the gap `gap` between tabs (at the end if `None`).
+    pub(crate) fn adopt_at(
+        &mut self,
+        mut tab: OpenTab,
+        gap: Option<usize>,
+        cx: &mut Context<Self>,
+    ) {
         tab._sub = self.track_dirty(&tab.editor, cx);
-        self.tabs.push(tab);
-        self.activate(self.tabs.len() - 1, cx);
+        let at = gap.unwrap_or(usize::MAX).min(self.tabs.len());
+        self.tabs.insert(at, tab);
+        self.activate(at, cx);
+    }
+
+    /// Drag-and-drop inside the strip: move tab `from` into the gap `gap` between tabs.
+    fn reorder_tab(&mut self, from: usize, gap: usize, cx: &mut Context<Self>) {
+        if from >= self.tabs.len() {
+            return;
+        }
+        let to = if gap > from { gap - 1 } else { gap }.min(self.tabs.len() - 1);
+        if to == from {
+            return;
+        }
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(to, tab);
+        self.activate(to, cx);
+        cx.notify();
     }
 
     /// Hand a tab to its new window.
@@ -1684,11 +2227,12 @@ impl Kalem {
         tab: OpenTab,
         dest: Dest,
         at: Option<Point<Pixels>>,
+        gap: Option<usize>,
         cx: &mut Context<Self>,
     ) {
         match dest {
             Dest::Main => {
-                self.adopt(tab, cx);
+                self.adopt_at(tab, gap, cx);
                 let _ = self.handle.update(cx, |_, w, _| w.activate_window());
             }
             Dest::Window(id) => {
@@ -1699,17 +2243,22 @@ impl Kalem {
                     .and_then(|w| w.view.upgrade().map(|v| (v, w.handle)));
                 match target {
                     Some((view, handle)) => {
-                        view.update(cx, |d, cx| d.adopt(tab, cx));
+                        view.update(cx, |d, cx| d.adopt_at(tab, gap, cx));
                         let _ = handle.update(cx, |_, w, _| w.activate_window());
                     }
                     None => self.adopt(tab, cx),
                 }
             }
-            Dest::New => self.open_detached(tab, at, cx),
+            Dest::New => self.open_detached(vec![tab], at, cx),
         }
     }
 
-    fn open_detached(&mut self, tab: OpenTab, at: Option<Point<Pixels>>, cx: &mut Context<Self>) {
+    fn open_detached(
+        &mut self,
+        tabs: Vec<OpenTab>,
+        at: Option<Point<Pixels>>,
+        cx: &mut Context<Self>,
+    ) {
         let id = self.next_win;
         self.next_win += 1;
         let main = cx.entity();
@@ -1729,12 +2278,12 @@ impl Kalem {
         // A new window draws its first frame immediately, and that frame reads this (main)
         // entity, so the window is opened once the current update has finished.
         cx.defer(move |cx| {
-            let slot = Rc::new(std::cell::RefCell::new(Some(tab)));
+            let slot = Rc::new(std::cell::RefCell::new(Some(tabs)));
             let slot2 = slot.clone();
             let m = main.clone();
             let opened = gpui_kit::open_window(options, cx, move |window, cx| {
-                let tab = slot2.borrow_mut().take().expect("tab is moved once");
-                cx.new(|cx| Detached::new(id, m, tab, window, cx))
+                let tabs = slot2.borrow_mut().take().expect("tabs are moved once");
+                cx.new(|cx| Detached::new(id, m, tabs, window, cx))
             });
             main.update(cx, |k, cx| match opened {
                 Ok((handle, view)) => k.windows.push(WinRef {
@@ -1745,7 +2294,7 @@ impl Kalem {
                 Err(e) => {
                     // Could not open a window: keep the tab where the user can still see it.
                     k.message = Some(format!("Could not open a new window: {e}"));
-                    if let Some(tab) = slot.borrow_mut().take() {
+                    for tab in slot.borrow_mut().take().unwrap_or_default() {
                         k.adopt(tab, cx);
                     }
                 }
@@ -1758,11 +2307,12 @@ impl Kalem {
         ix: usize,
         dest: Dest,
         at: Option<Point<Pixels>>,
+        gap: Option<usize>,
         cx: &mut Context<Self>,
     ) {
         if ix < self.tabs.len() && dest != Dest::Main {
             let tab = self.remove_tab(ix, cx);
-            self.deliver(tab, dest, at, cx);
+            self.deliver(tab, dest, at, gap, cx);
         }
     }
 
@@ -1771,8 +2321,16 @@ impl Kalem {
         let Some(ix) = self.tab_drag.take() else {
             return;
         };
+        let dragged = end_drag(cx).is_some_and(|d| d.moved);
+        if !dragged {
+            return; // a click
+        }
         if window.bounds().contains(&screen) {
-            return; // a click, or a drag that stayed inside
+            // Dropped inside: only the gaps of the tab strip take a tab.
+            if let Some(gap) = gap_at(cx, Dest::Main, screen) {
+                self.reorder_tab(ix, gap, cx);
+            }
+            return;
         }
         let wins: Vec<_> = self
             .windows_snapshot()
@@ -1780,7 +2338,10 @@ impl Kalem {
             .filter(|(d, _)| *d != Dest::Main)
             .collect();
         let dest = dest_at(&wins, screen, cx).unwrap_or(Dest::New);
-        self.move_tab(ix, dest, Some(screen), cx);
+        let gap = (dest != Dest::New)
+            .then(|| gap_at(cx, dest, screen))
+            .flatten();
+        self.move_tab(ix, dest, Some(screen), gap, cx);
     }
 
     fn save(&mut self, cx: &mut Context<Self>) {
@@ -1880,7 +2441,11 @@ impl Kalem {
         };
         self.bottom = Bottom::Output;
         let startup = self.startup.clone().or_else(|| ws.default_startup());
-        match ws.plan(kind, startup.as_deref(), self.config) {
+        let planned = match self.selected_profile().filter(|_| kind == TaskKind::Run) {
+            Some(p) => ws.profile_plan(p, startup.as_deref(), self.config),
+            None => ws.plan(kind, startup.as_deref(), self.config),
+        };
+        match planned {
             Err(e) => {
                 self.output
                     .push(format!("{} failed to start: {e}", kind.title()));
@@ -2477,7 +3042,7 @@ fn badge(kind: ChangeKind) -> (&'static str, u8) {
         ChangeKind::Deleted => ("D", 2),
         ChangeKind::Renamed => ("R", 0),
         ChangeKind::Copied => ("C", 1),
-        ChangeKind::Untracked => ("U", 1),
+        ChangeKind::Untracked => ("A", 1),
         ChangeKind::Conflicted => ("!", 2),
         ChangeKind::Ignored | ChangeKind::Other => ("?", 3),
     }
@@ -2580,6 +3145,10 @@ impl TabHost for Kalem {
     fn tab_grab(&mut self, ix: usize) {
         self.tab_drag = Some(ix);
     }
+
+    fn tab_op(&mut self, ix: usize, op: TabOp, window: &mut Window, cx: &mut Context<Self>) {
+        self.run_tab_op(ix, op, window, cx);
+    }
 }
 
 impl Render for Kalem {
@@ -2614,8 +3183,10 @@ impl Render for Kalem {
             .h(px(32.))
             .child(m("m-file", "File").dropdown_menu(|m, _, _| {
                 m.menu("Open Folder...", Box::new(OpenFolder))
+                    .menu("Open Solution or Project File...", Box::new(OpenSolution))
                     .menu("Save", Box::new(Save))
                     .menu("Close Tab", Box::new(CloseTab))
+                    .menu("Reopen Closed Tab", Box::new(RestoreTab))
                     .separator()
                     .menu("Exit", Box::new(Quit))
             }))
@@ -2636,6 +3207,16 @@ impl Render for Kalem {
                     .menu("Find All References (Shift+F12)", Box::new(FindReferences))
                     .menu("Rename Symbol (F2)", Box::new(RenameSymbol))
                     .menu("Format Document (Shift+Alt+F)", Box::new(FormatDocument))
+                    .separator()
+                    .menu("Next Error or Warning (F8)", Box::new(NextProblem))
+                    .menu(
+                        "Previous Error or Warning (Shift+F8)",
+                        Box::new(PrevProblem),
+                    )
+                    .separator()
+                    .menu("Zoom In (Ctrl+=)", Box::new(ZoomIn))
+                    .menu("Zoom Out (Ctrl+-)", Box::new(ZoomOut))
+                    .menu("Reset Zoom (Ctrl+0)", Box::new(ZoomReset))
             }))
             .child(m("m-view", "View").dropdown_menu(move |m, w, cx| {
                 let names = theme_names.clone();
@@ -2674,8 +3255,12 @@ impl Render for Kalem {
             }))
             .child(m("m-project", "Project").dropdown_menu({
                 let names = projects.clone();
-                move |mut m, _, _| {
-                    m = m.label("Set Startup Project");
+                move |m, _, _| {
+                    // A solution can have dozens of projects: the list scrolls.
+                    let mut m = m
+                        .max_h(px(420.))
+                        .scrollable(true)
+                        .label("Set Startup Project");
                     for (i, n) in names.iter().enumerate() {
                         m = m.menu(n.clone(), Box::new(SetStartup(i)));
                     }
@@ -2728,16 +3313,7 @@ impl Render for Kalem {
             )
             .child(div().flex_1())
             .when_some(self.ws.as_ref().map(|w| w.name()), |d, name| {
-                d.child(
-                    div()
-                        .px_3()
-                        .py_1()
-                        .text_sm()
-                        .rounded(px(4.))
-                        .border_1()
-                        .border_color(border)
-                        .child(name),
-                )
+                d.child(div().px_3().py_1().text_sm().child(name))
             });
 
         // ----------------------------------------------------------- toolbar
@@ -2746,6 +3322,27 @@ impl Render for Kalem {
             dir.and_then(|d| d.rsplit('/').next().map(str::to_string))
                 .or_else(|| projects.first().cloned())
                 .unwrap_or_else(|| "(no project)".into())
+        };
+        let (run_default, run_sel, run_profiles) = (
+            self.run_default.clone(),
+            self.profile_sel.clone(),
+            self.profiles.clone(),
+        );
+        let (run_label, run_tip) = match self.selected_profile() {
+            Some(p) => (
+                p.name.clone(),
+                format!(
+                    "Start Without Debugging (Ctrl+F5): {}",
+                    p.command
+                        .clone()
+                        .or_else(|| self.run_default.clone())
+                        .unwrap_or_default()
+                ),
+            ),
+            None => (
+                self.run_default.clone().unwrap_or_else(|| "Run".into()),
+                "Start Without Debugging (Ctrl+F5)".to_string(),
+            ),
         };
         let toolbar = div()
             .flex()
@@ -2782,6 +3379,14 @@ impl Render for Kalem {
                     .on_click(cx.listener(|this, _, w, cx| this.pick_folder(w, cx))),
             )
             .child(
+                Button::new("open-sln")
+                    .ghost()
+                    .compact()
+                    .icon(icon("layers"))
+                    .tooltip("Open Solution or Project File (Ctrl+Shift+O)")
+                    .on_click(cx.listener(|this, _, w, cx| this.pick_solution(w, cx))),
+            )
+            .child(
                 Button::new("save")
                     .ghost()
                     .compact()
@@ -2813,13 +3418,21 @@ impl Render for Kalem {
                 Button::new("startup")
                     .ghost()
                     .compact()
-                    .label(startup_label)
-                    .dropdown_caret(true)
+                    .label(startup_label.clone())
+                    // The toolkit's own caret is not in our icon set, so draw one.
+                    .child(icon("chevron-down").size_3().text_color(muted))
+                    .tooltip("Startup project")
                     .dropdown_menu({
                         let names = projects.clone();
-                        move |mut m, _, _| {
+                        let current = startup_label.clone();
+                        move |m, _, _| {
+                            let mut m = m.max_h(px(420.)).scrollable(true);
                             for (i, n) in names.iter().enumerate() {
-                                m = m.menu(n.clone(), Box::new(SetStartup(i)));
+                                m = m.menu_with_check(
+                                    n.clone(),
+                                    *n == current,
+                                    Box::new(SetStartup(i)),
+                                );
                             }
                             m
                         }
@@ -2830,10 +3443,14 @@ impl Render for Kalem {
                     .ghost()
                     .compact()
                     .label(self.config.name())
-                    .dropdown_caret(true)
-                    .dropdown_menu(|m, _, _| {
-                        m.menu("Debug", Box::new(ConfigDebug))
-                            .menu("Release", Box::new(ConfigRelease))
+                    .child(icon("chevron-down").size_3().text_color(muted))
+                    .tooltip("Build configuration")
+                    .dropdown_menu({
+                        let release = self.config.name() == "Release";
+                        move |m, _, _| {
+                            m.menu_with_check("Debug", !release, Box::new(ConfigDebug))
+                                .menu_with_check("Release", release, Box::new(ConfigRelease))
+                        }
                     }),
             )
             .child(
@@ -2841,10 +3458,34 @@ impl Render for Kalem {
                     .ghost()
                     .compact()
                     .icon(icon("play").text_color(c("success")))
-                    .label("Run")
-                    .tooltip("Start Without Debugging (Ctrl+F5)")
+                    .label(run_label)
+                    .tooltip(run_tip)
                     .disabled(!ws_open || running)
                     .on_click(cx.listener(|this, _, _, cx| this.start_task(TaskKind::Run, cx))),
+            )
+            .child(
+                Button::new("run-menu")
+                    .ghost()
+                    .compact()
+                    .icon(icon("chevron-down"))
+                    .tooltip("Choose what Run starts")
+                    .disabled(!ws_open)
+                    .dropdown_menu(move |mut m, _, _| {
+                        let default = match &run_default {
+                            Some(l) => format!("Default  ({l})"),
+                            None => "Default".to_string(),
+                        };
+                        m = m.menu_with_check(default, run_sel.is_none(), Box::new(SetProfile(0)));
+                        for (i, p) in run_profiles.iter().enumerate() {
+                            m = m.menu_with_check(
+                                p.summary(),
+                                run_sel.as_deref() == Some(p.name.as_str()),
+                                Box::new(SetProfile(i + 1)),
+                            );
+                        }
+                        m.separator()
+                            .menu("Configure Run Profiles...", Box::new(ConfigureProfiles))
+                    }),
             )
             .child(
                 Button::new("debug")
@@ -3024,8 +3665,16 @@ impl Render for Kalem {
             )
             .on_action(cx.listener(|this, _: &ToggleBreakpoint, _, cx| this.toggle_breakpoint(cx)))
             .on_action(cx.listener(|this, _: &Save, _, cx| this.save(cx)))
-            .on_action(cx.listener(|this, a: &MoveTab, _, cx| this.move_tab(a.0, a.1, None, cx)))
+            .on_action(
+                cx.listener(|this, a: &MoveTab, _, cx| this.move_tab(a.0, a.1, None, None, cx)),
+            )
+            .on_action(cx.listener(|this, a: &TabCmd, w, cx| this.run_tab_op(a.0, a.1, w, cx)))
+            .on_action(cx.listener(|this, a: &GitFileCmd, w, cx| {
+                this.git_file_op(&a.0, a.1, a.2, a.3, w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &RestoreTab, w, cx| this.restore_closed(w, cx)))
             .on_action(cx.listener(|this, _: &OpenFolder, w, cx| this.pick_folder(w, cx)))
+            .on_action(cx.listener(|this, _: &OpenSolution, w, cx| this.pick_solution(w, cx)))
             .on_action(cx.listener(|this, _: &CloseTab, _, cx| {
                 if let Some(i) = this.active {
                     this.close_tab(i, cx);
@@ -3084,6 +3733,16 @@ impl Render for Kalem {
             .on_action(cx.listener(|this, _: &RenameSymbol, w, cx| this.start_rename(w, cx)))
             .on_action(cx.listener(|this, _: &FormatDocument, _, cx| this.format_document(cx)))
             .on_action(cx.listener(|this, _: &CloseRename, w, cx| this.close_rename(w, cx)))
+            .on_action(cx.listener(|this, _: &NextProblem, w, cx| this.goto_problem(1, w, cx)))
+            .on_action(cx.listener(|this, _: &PrevProblem, w, cx| this.goto_problem(-1, w, cx)))
+            .on_action(cx.listener(|this, a: &SetZoom, _, cx| this.set_zoom(a.0 as u32, cx)))
+            .on_action(cx.listener(|this, _: &ZoomIn, _, cx| {
+                this.set_zoom(zoom::step(this.settings.zoom, 1), cx)
+            }))
+            .on_action(cx.listener(|this, _: &ZoomOut, _, cx| {
+                this.set_zoom(zoom::step(this.settings.zoom, -1), cx)
+            }))
+            .on_action(cx.listener(|this, _: &ZoomReset, _, cx| this.set_zoom(100, cx)))
             .on_action(cx.listener(|this, _: &FindNext, w, cx| this.find_step(1, false, w, cx)))
             .on_action(cx.listener(|this, _: &FindPrev, w, cx| this.find_step(-1, false, w, cx)))
             .on_action(cx.listener(|this, _: &FindNextFile, w, cx| this.find_step(1, true, w, cx)))
@@ -3113,12 +3772,24 @@ impl Render for Kalem {
             .on_action(cx.listener(|this, _: &ModeSystem, _, cx| this.set_mode(Mode::System, cx)))
             .on_action(cx.listener(|this, _: &ConfigDebug, _, cx| {
                 this.config = Config::Debug;
+                this.reload_profiles();
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ConfigRelease, _, cx| {
                 this.config = Config::Release;
+                this.reload_profiles();
                 cx.notify();
             }))
+            .on_action(cx.listener(|this, a: &SetProfile, _, cx| {
+                this.profile_sel =
+                    a.0.checked_sub(1)
+                        .and_then(|i| this.profiles.get(i))
+                        .map(|p| p.name.clone());
+                cx.notify();
+            }))
+            .on_action(
+                cx.listener(|this, _: &ConfigureProfiles, w, cx| this.configure_profiles(w, cx)),
+            )
             .on_action(cx.listener(|this, _: &OpenThemes, _, cx| this.open_themes_folder(cx)))
             .on_action(cx.listener(|this, _: &ReloadThemes, _, cx| this.reload_themes(cx)))
             .on_action(cx.listener(|this, a: &SetTheme, _, cx| this.set_theme(a.0, cx)))
@@ -3126,6 +3797,7 @@ impl Render for Kalem {
                 if let Some(ws) = &this.ws {
                     this.startup = ws.projects().get(a.0).map(|p| p.dir.clone());
                 }
+                this.reload_profiles();
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &About, _, cx| {
@@ -3148,16 +3820,15 @@ impl Render for Kalem {
                     .justify_center()
                     .gap_2()
                     .child(div().text_xl().child("Kalem IDE"))
-                    .child(
-                        div()
-                            .text_color(muted)
-                            .child("Open a folder or a .kalem / .slnx / .sln file (Ctrl+O)"),
-                    ),
+                    .child(div().text_color(muted).child(
+                        "Open a folder (Ctrl+O) or a solution / project file (Ctrl+Shift+O)",
+                    )),
             );
         };
 
         // ------------------------------------------------- Solution Explorer
         let proj_kinds = self.proj_kinds.clone();
+        let nest_parents = self.nest_parents.clone();
         let changes = self.changes.clone();
         let git_ok = self.git.is_ok();
         let pal2 = pal.clone();
@@ -3194,10 +3865,12 @@ impl Render for Kalem {
                 div().flex_1().min_h_0().child(
                     tree(&self.tree, move |ix, entry, _sel, _w, _cx| {
                         let id = entry.item().id.clone();
-                        let is_folder = entry.is_folder();
+                        // A file with files nested under it expands like a folder but opens on click.
+                        let expandable = entry.is_folder();
+                        let is_folder = expandable && !nest_parents.contains(id.as_ref());
                         let name = entry.item().label.to_string();
                         let view = view.clone();
-                        let chevron = div().w(px(16.)).when(is_folder, |d| {
+                        let chevron = div().w(px(16.)).when(expandable, |d| {
                             d.child(
                                 icon(if entry.is_expanded() {
                                     "chevron-down"
@@ -3284,6 +3957,7 @@ impl Render for Kalem {
                 let ov = ChangesOverview::from_status(st);
                 let message = self.commit_msg.read(cx).value().to_string();
                 let commit_btn = ov.commit_button(&message, self.amend);
+                let git_pal = self.palette.clone();
                 let colour = |class: u8| match class {
                     0 => warning_c,
                     1 => success_c,
@@ -3293,22 +3967,66 @@ impl Render for Kalem {
                 let v = cx.entity();
 
                 // One changed file: [letter] name dir ............ [+/-]
-                let row = |id: usize, path: String, k: ChangeKind, staged: bool| {
+                let row = |id: usize, path: String, k: ChangeKind, staged: bool, depth: usize| {
                     let (letter, class) = badge(k);
-                    let (dir, name) = match path.trim_end_matches('/').rsplit_once('/') {
-                        Some((d, n)) => (format!("{d}/"), n.to_string()),
-                        None => (String::new(), path.trim_end_matches('/').to_string()),
-                    };
+                    let name = path
+                        .trim_end_matches('/')
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or_default()
+                        .to_string();
                     let (open, act) = (v.clone(), v.clone());
                     let p_open = path.clone();
+                    let p_menu = path.clone();
+                    let (undo, p_undo) = (v.clone(), path.clone());
+                    let is_dir = path.ends_with('/');
+                    // Added or untracked: nothing to compare with or to look up in the history.
+                    let known = !is_dir && !matches!(k, ChangeKind::Untracked | ChangeKind::Added);
+                    let untracked_row = k == ChangeKind::Untracked;
                     div()
                         .id(("chg", id))
                         .group("chg-row")
+                        .hover(move |d| d.bg(list_active))
+                        .context_menu(move |m, _, _| {
+                            let c = |op| {
+                                Box::new(GitFileCmd(p_menu.clone(), op, staged, untracked_row))
+                            };
+                            m.menu_with_disabled("Open", c(GitFileOp::Open), is_dir)
+                                .menu(
+                                    if staged { "Unstage" } else { "Stage" },
+                                    c(if staged {
+                                        GitFileOp::Unstage
+                                    } else {
+                                        GitFileOp::Stage
+                                    }),
+                                )
+                                .menu_with_disabled(
+                                    "Undo Changes",
+                                    c(GitFileOp::Discard),
+                                    staged || is_dir,
+                                )
+                                .separator()
+                                .menu_with_disabled("View History", c(GitFileOp::History), !known)
+                                .menu_with_disabled(
+                                    "Compare with Unmodified...",
+                                    c(GitFileOp::Compare),
+                                    !known,
+                                )
+                                .menu_with_disabled("Blame (Annotate)", c(GitFileOp::Blame), !known)
+                                .separator()
+                                .menu("Delete", c(GitFileOp::Delete))
+                                .separator()
+                                .menu("Ignore this local item", c(GitFileOp::IgnoreItem))
+                                .menu_with_disabled(
+                                    "Ignore this Extension",
+                                    c(GitFileOp::IgnoreExtension),
+                                    is_dir,
+                                )
+                        })
                         .flex()
                         .items_center()
                         .pr_1()
                         .text_sm()
-                        .hover(move |d| d.bg(list_active))
                         .child(
                             div()
                                 .id(("chg-open", id))
@@ -3317,21 +4035,22 @@ impl Render for Kalem {
                                 .flex()
                                 .items_center()
                                 .gap_2()
-                                .px_2()
+                                .pr_2()
+                                .pl(px(8. + 16. + 14. * depth as f32))
                                 .cursor_pointer()
-                                .child(
-                                    div()
-                                        .w(px(14.))
-                                        .flex_none()
-                                        .text_color(colour(class))
-                                        .child(letter),
-                                )
+                                .child(if path.ends_with('/') {
+                                    icon("folder")
+                                        .size_4()
+                                        .text_color(folder_c)
+                                        .into_any_element()
+                                } else {
+                                    file_icon(&name, &git_pal, muted)
+                                })
                                 .child(div().flex_none().child(if path.ends_with('/') {
                                     format!("{name}/")
                                 } else {
                                     name
                                 }))
-                                .child(div().truncate().text_xs().text_color(muted).child(dir))
                                 .on_click(move |ev, window, cx| {
                                     let p = p_open.clone();
                                     let untracked = k == ChangeKind::Untracked;
@@ -3345,6 +4064,32 @@ impl Render for Kalem {
                                     });
                                 }),
                         )
+                        .when(!staged && !is_dir, |d| {
+                            d.child(
+                                Button::new(("chg-undo", id))
+                                    .ghost()
+                                    .compact()
+                                    .icon(icon("undo-2"))
+                                    .tooltip(if untracked_row {
+                                        "Delete this new file"
+                                    } else {
+                                        "Undo changes"
+                                    })
+                                    .on_click(move |_, window, cx| {
+                                        let p = p_undo.clone();
+                                        undo.update(cx, |this, cx| {
+                                            this.git_file_op(
+                                                &p,
+                                                GitFileOp::Discard,
+                                                false,
+                                                untracked_row,
+                                                window,
+                                                cx,
+                                            )
+                                        });
+                                    }),
+                            )
+                        })
                         .child(
                             Button::new(("chg-act", id))
                                 .ghost()
@@ -3363,6 +4108,128 @@ impl Render for Kalem {
                                     });
                                 }),
                         )
+                        .child(
+                            div()
+                                .w(px(16.))
+                                .flex_none()
+                                .text_center()
+                                .text_color(colour(class))
+                                .child(letter),
+                        )
+                };
+                let folder_projects = self.proj_kinds.clone();
+                // A folder of the changed-files tree: click to fold, button to (un)stage all in it.
+                let folder_row = |id: usize,
+                                  path: String,
+                                  label: String,
+                                  depth: usize,
+                                  count: usize,
+                                  collapsed: bool,
+                                  staged: bool| {
+                    let key = format!("{}:{path}", if staged { "s" } else { "c" });
+                    let (toggle, act) = (v.clone(), v.clone());
+                    let project = folder_projects.get(&path).copied();
+                    let dir_arg = format!("{path}/");
+                    div()
+                        .id(("chg-dir", id))
+                        .flex()
+                        .items_center()
+                        .pr_1()
+                        .text_sm()
+                        .hover(move |d| d.bg(list_active))
+                        .child(
+                            div()
+                                .id(("chg-dir-open", id))
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .items_center()
+                                .gap(px(4.))
+                                .pr_2()
+                                .pl(px(8. + 14. * depth as f32))
+                                .cursor_pointer()
+                                .child(
+                                    icon(if collapsed {
+                                        "chevron-right"
+                                    } else {
+                                        "chevron-down"
+                                    })
+                                    .size_4()
+                                    .text_color(muted),
+                                )
+                                .child(match project {
+                                    Some(k) => icon(kind_icon(k)).size_4().text_color(project_c),
+                                    None => icon(if collapsed { "folder" } else { "folder-open" })
+                                        .size_4()
+                                        .text_color(folder_c),
+                                })
+                                .child(div().truncate().child(label))
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .text_xs()
+                                        .text_color(muted)
+                                        .child(format!("{count}")),
+                                )
+                                .on_click(move |_, _, cx| {
+                                    let key = key.clone();
+                                    toggle.update(cx, |this, cx| {
+                                        if !this.chg_collapsed.remove(&key) {
+                                            this.chg_collapsed.insert(key);
+                                        }
+                                        cx.notify();
+                                    });
+                                }),
+                        )
+                        .child(
+                            Button::new(("chg-dir-act", id))
+                                .ghost()
+                                .compact()
+                                .icon(icon(if staged { "minus" } else { "plus" }))
+                                .tooltip(if staged {
+                                    "Unstage all in this folder"
+                                } else {
+                                    "Stage all in this folder"
+                                })
+                                .on_click(move |_, window, cx| {
+                                    let paths = vec![dir_arg.clone()];
+                                    act.update(cx, |this, cx| {
+                                        let op = if staged {
+                                            GitOp::Unstage(paths)
+                                        } else {
+                                            GitOp::Stage(paths)
+                                        };
+                                        this.git_op("stage", op, window, cx)
+                                    });
+                                }),
+                        )
+                };
+                // The changed files of one list as a folder tree.
+                let collapsed_set = self.chg_collapsed.clone();
+                let tree_rows = |list: &[(&kalem_vcs::StatusEntry, ChangeKind)],
+                                 staged: bool,
+                                 base: usize|
+                 -> Vec<AnyElement> {
+                    let tag = if staged { "s" } else { "c" };
+                    let files: Vec<(String, ChangeKind)> =
+                        list.iter().map(|(e, k)| (e.path.clone(), *k)).collect();
+                    change_tree(&files, &|p| collapsed_set.contains(&format!("{tag}:{p}")))
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, r)| match r {
+                            TreeRow::Folder {
+                                path,
+                                label,
+                                depth,
+                                files,
+                                collapsed,
+                            } => folder_row(base + i, path, label, depth, files, collapsed, staged)
+                                .into_any_element(),
+                            TreeRow::File { path, kind, depth } => {
+                                row(base + i, path, kind, staged, depth).into_any_element()
+                            }
+                        })
+                        .collect()
                 };
                 let head = |t: String, action: Option<AnyElement>| {
                     div()
@@ -3639,22 +4506,12 @@ impl Render for Kalem {
                                 format!("Staged Changes ({})", staged.len()),
                                 (!staged.is_empty()).then_some(unstage_all),
                             ))
-                            .children(
-                                staged
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(i, (e, k))| row(i, e.path.clone(), *k, true)),
-                            )
+                            .children(tree_rows(&staged, true, 0))
                             .child(head(
                                 format!("Changes ({})", changes_l.len()),
                                 (!changes_l.is_empty()).then_some(stage_all),
                             ))
-                            .children(
-                                changes_l
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(i, (e, k))| row(10_000 + i, e.path.clone(), *k, false)),
-                            )
+                            .children(tree_rows(&changes_l, false, 10_000))
                             .when(staged.is_empty() && changes_l.is_empty(), |d| {
                                 d.child(div().p_2().text_color(muted).child("Working tree clean"))
                             })
@@ -3906,12 +4763,22 @@ impl Render for Kalem {
             border,
             active_bg: theme.list_active,
             dests: self.window_menu(None),
+            me: Dest::Main,
+            can_restore: self.can_restore_tab(),
         };
         let tabs_row = tab_strip(&self.tabs, self.active, &sc, cx);
+        let editor_bar = self.editor_bar(fg, muted, border, cx);
+        let zoom_view = cx.entity();
         let editor_area = div()
             .size_full()
             .flex()
             .flex_col()
+            .relative()
+            .child(wheel_zoom_probe(move |dir, _, cx| {
+                zoom_view.update(cx, |k, cx| {
+                    k.set_zoom(zoom::step(zoom::percent(cx), dir), cx)
+                })
+            }))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
@@ -3934,9 +4801,11 @@ impl Render for Kalem {
                             muted,
                             border,
                             true,
+                            zoom::text_size(cx),
                         ),
                         Some(t) => Editor::new(&t.editor)
                             .appearance(false)
+                            .text_size(zoom::text_size(cx))
                             .h_full()
                             .into_any_element(),
                         None => div()
@@ -3948,7 +4817,8 @@ impl Render for Kalem {
                             .child("Open a file from the Solution Explorer (Ctrl+P to search)")
                             .into_any_element(),
                     }),
-            );
+            )
+            .when_some(editor_bar, |d, bar| d.child(bar));
 
         // --------------------------------------------------- Output / Tests
         let out_start = self.output.len().saturating_sub(400);
@@ -4250,6 +5120,7 @@ impl Render for Kalem {
 
         let overlay = self.find_overlay(window, cx);
         let rename = self.rename_overlay(cx);
+        let dragging = drag_overlay(Dest::Main, accent, fg, theme.popover, window, cx);
 
         // The top row: the editor, the docked panels beside it, an auto-hidden panel sliding over
         // the editor, and the edge strip that lists the collapsed panels.
@@ -4299,8 +5170,10 @@ impl Render for Kalem {
         )
         .child(status)
         .child(mouse_up_probe(cx.entity(), Kalem::tab_mouse_up))
+        .child(drag_probe(Dest::Main))
         .children(quick)
         .children(rename)
         .children(overlay)
+        .children(dragging)
     }
 }

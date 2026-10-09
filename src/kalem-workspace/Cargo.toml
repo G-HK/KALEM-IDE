@@ -13,3 +13,4 @@ kalem-vcs = { path = "../kalem-vcs" }
 kalem-test = { path = "../kalem-test" }
 regex = "1"
 serde_json.workspace = true
+toml.workspace = true

@@ -56,6 +56,8 @@ pub struct TaskPlan {
     pub program: String,
     pub args: Vec<String>,
     pub cwd: PathBuf,
+    /// Extra environment variables for the process.
+    pub env: Vec<(String, String)>,
 }
 
 impl TaskPlan {
@@ -180,6 +182,7 @@ impl Workspace {
             program,
             args,
             cwd,
+            env: Vec::new(),
         })
     }
 }
@@ -243,6 +246,7 @@ pub fn spawn(plan: &TaskPlan) -> RunningTask {
     let child_slot: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
     let mut cmd = Command::new(&plan.program);
     cmd.args(&plan.args)
+        .envs(plan.env.iter().map(|(k, v)| (k, v)))
         .current_dir(&plan.cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -357,6 +361,7 @@ mod tests {
             program: cargo,
             args: vec!["--version".into()],
             cwd: std::env::temp_dir(),
+            env: Vec::new(),
         };
         let t = spawn(&plan);
         let mut lines = Vec::new();
@@ -382,6 +387,7 @@ mod tests {
             program: "definitely-not-a-program-kalem".into(),
             args: vec![],
             cwd: std::env::temp_dir(),
+            env: Vec::new(),
         };
         let t = spawn(&plan);
         assert!(matches!(
