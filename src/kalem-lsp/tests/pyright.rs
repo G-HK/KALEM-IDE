@@ -71,6 +71,23 @@ fn diagnostics_hover_completion_and_definition() {
     };
     assert!(labels.iter().any(|l| l == "print"), "got {labels:?}");
 
+    // References of `double`: its definition and the call (the buffer now ends in `pri`).
+    server.did_change(&uri, 3, SOURCE).unwrap();
+    let refs = server.references(&uri, 3, 14).unwrap();
+    let lines: Vec<u32> = refs.iter().map(|r| r.range.start.line).collect();
+    assert!(lines.contains(&0) && lines.contains(&3), "got {lines:?}");
+
+    // Renaming it touches both places.
+    let edit = server
+        .rename(&uri, 3, 14, "twice")
+        .unwrap()
+        .expect("a workspace edit");
+    let files = kalem_lsp::flatten(edit);
+    assert_eq!(files.len(), 1);
+    let renamed = kalem_lsp::apply_edits(SOURCE, &files[0].1);
+    assert!(renamed.contains("def twice(n: int)"), "{renamed}");
+    assert!(renamed.contains("value: str = twice(3)"), "{renamed}");
+
     server.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -144,6 +144,22 @@ impl GitCli {
         Ok(String::from_utf8_lossy(&out).trim().to_string())
     }
 
+    /// The recent history as a graph, one line per commit (what "View all commits" shows).
+    pub fn log(&self, repo: &Path) -> Result<String, VcsError> {
+        self.run_text(
+            repo,
+            &[
+                "log",
+                "--graph",
+                "--oneline",
+                "--decorate",
+                "--all",
+                "-n",
+                "300",
+            ],
+        )
+    }
+
     pub fn fetch(&self, repo: &Path) -> Result<String, VcsError> {
         self.run_text(repo, &["fetch", "--all", "--prune"])
     }

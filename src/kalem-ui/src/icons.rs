@@ -51,6 +51,13 @@ svgs!(
     "sun",
     "moon",
     "x",
+    "pin",
+    "pin-off",
+    "ellipsis",
+    "arrow-down-to-line",
+    "arrow-up-to-line",
+    "arrow-up-down",
+    "git-graph",
 );
 
 pub fn icon(name: &str) -> Icon {

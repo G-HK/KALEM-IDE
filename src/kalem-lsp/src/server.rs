@@ -5,7 +5,10 @@
 
 use crate::client::{Client, LspError, Notification};
 use crate::uri::path_to_uri;
-use lsp_types::{CompletionResponse, GotoDefinitionResponse, Hover, LocationLink};
+use lsp_types::{
+    CompletionResponse, GotoDefinitionResponse, Hover, Location, LocationLink, TextEdit,
+    WorkspaceEdit,
+};
 use serde_json::{json, Value};
 use std::path::Path;
 use std::time::Duration;
@@ -81,6 +84,9 @@ impl Server {
                         },
                         "hover": {"contentFormat": ["markdown", "plaintext"]},
                         "definition": {"linkSupport": true},
+                        "references": {},
+                        "rename": {"prepareSupport": false},
+                        "formatting": {},
                         "publishDiagnostics": {"relatedInformation": true},
                     },
                 },
@@ -118,6 +124,18 @@ impl Server {
     pub fn can_hover(&self) -> bool {
         !self.capabilities["hoverProvider"].is_null()
             && self.capabilities["hoverProvider"] != json!(false)
+    }
+    pub fn can_find_references(&self) -> bool {
+        self.has("referencesProvider")
+    }
+    pub fn can_rename(&self) -> bool {
+        self.has("renameProvider")
+    }
+    pub fn can_format(&self) -> bool {
+        self.has("documentFormattingProvider")
+    }
+    fn has(&self, capability: &str) -> bool {
+        !self.capabilities[capability].is_null() && self.capabilities[capability] != json!(false)
     }
     pub fn can_define(&self) -> bool {
         !self.capabilities["definitionProvider"].is_null()
@@ -213,6 +231,55 @@ impl Server {
             Some(GotoDefinitionResponse::Scalar(loc)) => vec![link_of(loc)],
             Some(GotoDefinitionResponse::Array(a)) => a.into_iter().map(link_of).collect(),
         })
+    }
+
+    pub fn references(
+        &self,
+        uri: &str,
+        line: u32,
+        character: u32,
+    ) -> Result<Vec<Location>, LspError> {
+        let mut params = pos_params(uri, line, character);
+        params["context"] = json!({"includeDeclaration": true});
+        let v = self
+            .client
+            .request("textDocument/references", params, REQUEST_TIMEOUT)?;
+        Ok(parse(v).unwrap_or_default())
+    }
+
+    /// The edits that rename the symbol at a position (`None`: nothing to rename there).
+    pub fn rename(
+        &self,
+        uri: &str,
+        line: u32,
+        character: u32,
+        new_name: &str,
+    ) -> Result<Option<WorkspaceEdit>, LspError> {
+        let mut params = pos_params(uri, line, character);
+        params["newName"] = json!(new_name);
+        Ok(parse(self.client.request(
+            "textDocument/rename",
+            params,
+            REQUEST_TIMEOUT,
+        )?))
+    }
+
+    pub fn format(
+        &self,
+        uri: &str,
+        tab_size: u32,
+        insert_spaces: bool,
+    ) -> Result<Vec<TextEdit>, LspError> {
+        let v = self.client.request(
+            "textDocument/formatting",
+            json!({
+                "textDocument": {"uri": uri},
+                "options": {"tabSize": tab_size, "insertSpaces": insert_spaces},
+            }),
+            // Formatters can be slow on big files.
+            Duration::from_secs(30),
+        )?;
+        Ok(parse(v).unwrap_or_default())
     }
 
     // ---------------------------------------------------- notifications

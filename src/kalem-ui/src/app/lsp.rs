@@ -590,3 +590,435 @@ impl Kalem {
             .join("  ")
     }
 }
+
+// ------------------------------------------------ references, rename, format
+
+/// The identifier around a column (a character index) of a line.
+fn word_at(line: &str, col: usize) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let mut a = col.min(chars.len());
+    // The cursor often sits just after the word.
+    if a > 0 && (a == chars.len() || !is_word(chars[a])) && is_word(chars[a - 1]) {
+        a -= 1;
+    }
+    if a >= chars.len() || !is_word(chars[a]) {
+        return String::new();
+    }
+    let mut s = a;
+    while s > 0 && is_word(chars[s - 1]) {
+        s -= 1;
+    }
+    let mut e = a;
+    while e < chars.len() && is_word(chars[e]) {
+        e += 1;
+    }
+    chars[s..e].iter().collect()
+}
+
+/// What an editor command needs: the active file, its server and the cursor.
+struct Target {
+    rel: String,
+    editor: Entity<EditorState>,
+    server: Arc<Server>,
+    sync: Arc<Mutex<DocSync>>,
+    uri: String,
+    pos: kalem_lsp::lsp_types::Position,
+    word: String,
+    version: i32,
+}
+
+/// State of the Rename Symbol prompt.
+pub(super) struct RenameState {
+    rel: String,
+    pos: kalem_lsp::lsp_types::Position,
+    old: String,
+}
+
+impl Kalem {
+    /// The active file's server and cursor, or a status message saying why not.
+    fn lsp_target(&mut self, cx: &mut Context<Self>) -> Option<Target> {
+        let tab = self
+            .active
+            .and_then(|i| self.tabs.get(i))
+            .filter(|t| t.diff.is_none())?;
+        let rel = tab.path.clone();
+        let editor = tab.editor.clone();
+        let doc = self.lsp.docs.get(&rel);
+        let server = doc.and_then(|d| {
+            self.lsp
+                .servers
+                .get(&d.pack)
+                .and_then(|e| e.slot.get().cloned())
+        });
+        let (Some(doc), Some(server)) = (doc, server) else {
+            self.status_text = "No language server is running for this file".into();
+            cx.notify();
+            return None;
+        };
+        let (sync, uri) = (doc.sync.clone(), doc.uri.clone());
+        let text = editor.read(cx).value();
+        let p = editor.read(cx).cursor_position();
+        let line = text.lines().nth(p.line as usize).unwrap_or("");
+        let word = word_at(line, p.character as usize);
+        // Make sure the server is sent the text the cursor refers to.
+        let version = {
+            let mut s = sync.lock().unwrap();
+            if s.dirty {
+                s.queue(text.to_string());
+            }
+            s.version
+        };
+        Some(Target {
+            rel,
+            editor,
+            server,
+            sync,
+            uri,
+            pos: kalem_lsp::lsp_types::Position::new(p.line, p.character),
+            word,
+            version,
+        })
+    }
+
+    /// Shift+F12: every reference of the symbol under the cursor, in the Find Results.
+    pub(super) fn find_references(&mut self, cx: &mut Context<Self>) {
+        let Some(t) = self.lsp_target(cx) else { return };
+        if !t.server.can_find_references() {
+            self.status_text = "This language server cannot find references".into();
+            cx.notify();
+            return;
+        }
+        self.status_text = "Finding references...".into();
+        let word = t.word.clone();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    drain(&t.sync, &t.server, &t.uri);
+                    t.server.references(&t.uri, t.pos.line, t.pos.character)
+                })
+                .await;
+            let _ = this.update(cx, |k, cx| k.show_references(&word, res, cx));
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn show_references(
+        &mut self,
+        word: &str,
+        res: Result<Vec<kalem_lsp::lsp_types::Location>, kalem_lsp::LspError>,
+        cx: &mut Context<Self>,
+    ) {
+        let locations = match res {
+            Ok(l) => l,
+            Err(e) => {
+                self.status_text = format!("Find references failed: {e}");
+                cx.notify();
+                return;
+            }
+        };
+        let mut texts: HashMap<String, Vec<String>> = HashMap::new();
+        let mut hits = Vec::new();
+        for loc in &locations {
+            let Some(rel) =
+                uri_to_path(loc.uri.as_str()).and_then(|p| self.rel_of(&p.display().to_string()))
+            else {
+                continue;
+            };
+            if !texts.contains_key(&rel) {
+                let open = self
+                    .lsp
+                    .docs
+                    .get(&rel)
+                    .and_then(|d| d.editor.upgrade())
+                    .map(|e| e.read(cx).value().to_string());
+                let text = open
+                    .or_else(|| self.ws.as_ref().and_then(|w| w.read_file(&rel).ok()))
+                    .unwrap_or_default();
+                texts.insert(rel.clone(), text.lines().map(str::to_string).collect());
+            }
+            let line = loc.range.start.line as usize;
+            hits.push(kalem_workspace::search::Hit {
+                text: texts[&rel]
+                    .get(line)
+                    .map(|l| l.trim().to_string())
+                    .unwrap_or_default(),
+                path: rel,
+                line: line + 1,
+                col: loc.range.start.character as usize,
+            });
+        }
+        hits.sort_by(|a, b| (&a.path, a.line, a.col).cmp(&(&b.path, b.line, b.col)));
+        let files = hits
+            .iter()
+            .map(|h| h.path.as_str())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        self.find_query = format!("references of {word}");
+        self.find = Some(kalem_workspace::search::SearchResult {
+            hits,
+            files_searched: files,
+            truncated: false,
+        });
+        self.find_gen += 1;
+        self.find_busy = false;
+        self.find_cur = None;
+        self.bottom = Bottom::Find;
+        self.status_text = "Ready".into();
+        cx.notify();
+    }
+
+    // ------------------------------------------------------------ rename
+
+    /// F2: ask for the new name of the symbol under the cursor.
+    pub(super) fn start_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(t) = self.lsp_target(cx) else { return };
+        if !t.server.can_rename() {
+            self.status_text = "This language server cannot rename symbols".into();
+            cx.notify();
+            return;
+        }
+        if t.word.is_empty() {
+            self.status_text = "Put the cursor on a symbol to rename it".into();
+            cx.notify();
+            return;
+        }
+        self.rename = Some(RenameState {
+            rel: t.rel,
+            pos: t.pos,
+            old: t.word.clone(),
+        });
+        let word = t.word;
+        self.rename_input.update(cx, |i, cx| {
+            i.set_value(word, window, cx);
+            i.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    pub(super) fn close_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.rename.take().is_some() {
+            window.focus(&self.focus, cx);
+            cx.notify();
+        }
+    }
+
+    pub(super) fn commit_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(r) = self.rename.take() else { return };
+        let new_name = self.rename_input.read(cx).value().trim().to_string();
+        window.focus(&self.focus, cx);
+        if new_name.is_empty() || new_name == r.old {
+            cx.notify();
+            return;
+        }
+        let Some(t) = self.lsp_target(cx).filter(|t| t.rel == r.rel) else {
+            return;
+        };
+        self.status_text = format!("Renaming {} to {new_name}...", r.old);
+        let (old, pos) = (r.old, r.pos);
+        cx.spawn_in(window, async move |this, cx| {
+            let name = new_name.clone();
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    drain(&t.sync, &t.server, &t.uri);
+                    t.server.rename(&t.uri, pos.line, pos.character, &name)
+                })
+                .await;
+            let _ = this.update_in(cx, |k, window, cx| match res {
+                Ok(Some(edit)) => k.apply_workspace_edit(edit, &old, &new_name, window, cx),
+                Ok(None) => {
+                    k.status_text = format!("{old} cannot be renamed here");
+                    cx.notify();
+                }
+                Err(e) => {
+                    k.status_text = format!("Rename failed: {e}");
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Apply a server's edits: open files change in their editors (so they can be undone
+    /// by closing without saving), the rest are rewritten on disk.
+    fn apply_workspace_edit(
+        &mut self,
+        edit: kalem_lsp::lsp_types::WorkspaceEdit,
+        old: &str,
+        new: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut files = 0;
+        let mut places = 0;
+        let mut errors = Vec::new();
+        for (uri, edits) in kalem_lsp::flatten(edit) {
+            let Some(rel) = uri_to_path(&uri).and_then(|p| self.rel_of(&p.display().to_string()))
+            else {
+                continue;
+            };
+            places += edits.len();
+            files += 1;
+            if let Some(editor) = self.lsp.docs.get(&rel).and_then(|d| d.editor.upgrade()) {
+                let text = editor.read(cx).value().to_string();
+                let changed = kalem_lsp::apply_edits(&text, &edits);
+                self.set_editor_text(&editor, changed, window, cx);
+            } else if let Some(ws) = &self.ws {
+                match ws.read_file(&rel) {
+                    Ok(text) => {
+                        if let Err(e) = ws.write_file(&rel, &kalem_lsp::apply_edits(&text, &edits))
+                        {
+                            errors.push(e);
+                        }
+                    }
+                    Err(e) => errors.push(e),
+                }
+            }
+        }
+        self.refresh(cx);
+        self.status_text = if errors.is_empty() {
+            format!("Renamed {old} to {new}: {places} places in {files} files (save to keep the open ones)")
+        } else {
+            format!("Rename incomplete: {}", errors.join("; "))
+        };
+        cx.notify();
+    }
+
+    /// Replace an editor's text, keeping the cursor line.
+    fn set_editor_text(
+        &mut self,
+        editor: &Entity<EditorState>,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        editor.update(cx, |e, cx| {
+            let pos = e.cursor_position();
+            e.set_value(text, window, cx);
+            e.set_cursor_position(pos, window, cx);
+        });
+        // `set_value` raises no change event: mark the tab and tell the server ourselves.
+        let now = editor.read(cx).value();
+        let mut changed = None;
+        for t in self.tabs.iter_mut().filter(|t| &t.editor == editor) {
+            t.dirty = now != t.saved;
+            changed = Some(t.path.clone());
+        }
+        let changed = changed.or_else(|| {
+            self.lsp
+                .docs
+                .iter()
+                .find(|(_, d)| d.editor.upgrade().as_ref() == Some(editor))
+                .map(|(r, _)| r.clone())
+        });
+        if let Some(rel) = changed {
+            self.lsp_changed(&rel, cx);
+        }
+        cx.notify();
+    }
+
+    pub(super) fn rename_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let r = self.rename.as_ref()?;
+        let theme = cx.theme().clone();
+        let accent = rgba(self.palette.get("accent"));
+        Some(
+            div()
+                .absolute()
+                .top(px(72.))
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .key_context("Rename")
+                        .w(px(420.))
+                        .p_2()
+                        .rounded(px(6.))
+                        .border_1()
+                        .border_color(accent)
+                        .bg(theme.popover)
+                        .child(
+                            div()
+                                .pb_1()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(format!(
+                                    "Rename '{}' (Enter to apply, Esc to cancel)",
+                                    r.old
+                                )),
+                        )
+                        .child(Input::new(&self.rename_input)),
+                )
+                .into_any_element(),
+        )
+    }
+
+    // ------------------------------------------------------------ format
+
+    /// Shift+Alt+F: let the language server format the whole document.
+    pub(super) fn format_document(&mut self, cx: &mut Context<Self>) {
+        let Some(t) = self.lsp_target(cx) else { return };
+        if !t.server.can_format() {
+            self.status_text = "This language server cannot format documents".into();
+            cx.notify();
+            return;
+        }
+        self.status_text = "Formatting...".into();
+        let handle = self.handle;
+        let (editor, server, sync, uri, version) = (t.editor, t.server, t.sync, t.uri, t.version);
+        cx.spawn(async move |this, cx| {
+            let (s2, u2, sync2) = (server.clone(), uri.clone(), sync.clone());
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    drain(&sync2, &s2, &u2);
+                    s2.format(&u2, 4, true)
+                })
+                .await;
+            // Setting the text needs the window.
+            let _ = cx.update_window(handle, |_, window, app| {
+                this.update(app, |k, cx| match res {
+                    Ok(edits) => {
+                        // Typing went on while the server worked: do not clobber it.
+                        if sync.lock().unwrap().version != version {
+                            k.status_text = "Formatting skipped: the file changed".into();
+                        } else if edits.is_empty() {
+                            k.status_text = "Already formatted".into();
+                        } else {
+                            let text = editor.read(cx).value().to_string();
+                            let out = kalem_lsp::apply_edits(&text, &edits);
+                            k.set_editor_text(&editor, out, window, cx);
+                            k.status_text = "Formatted".into();
+                        }
+                        cx.notify();
+                    }
+                    Err(e) => {
+                        k.status_text = format!("Format failed: {e}");
+                        cx.notify();
+                    }
+                })
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::word_at;
+
+    #[test]
+    fn finds_the_word_around_or_before_the_cursor() {
+        assert_eq!(word_at("let total = add(x);", 5), "total");
+        assert_eq!(word_at("let total = add(x);", 9), "total"); // just after it
+        assert_eq!(word_at("let total = add(x);", 4), "total"); // at its start
+        assert_eq!(word_at("a + b", 2), ""); // on the operator
+        assert_eq!(word_at("   ", 1), "");
+    }
+}

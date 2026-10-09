@@ -23,11 +23,15 @@ is on your `PATH`.
 - **Completion**: pops up while you type and after the server's trigger characters (`.`, `::`, ...).
 - **Hover**: type and documentation under the mouse.
 - **Go to definition**: Ctrl/Cmd+click on a symbol; other files of the folder open at the target.
+- **Find all references** (Shift+F12): the results fill the Find Results panel (F3 steps through them).
+- **Rename symbol** (F2): asks for the new name; open files change in their editors (save to keep them),
+  other files are rewritten on disk.
+- **Format document** (Shift+Alt+F), for servers that can format (rust-analyzer, gopls, clangd, ...).
 - The server is told about every edit (after a 150 ms pause, or at once when a request needs it), and about
   saves (rust-analyzer runs `cargo check` on save) and closed tabs.
 - A missing or crashing server is reported in the Output panel and the status bar; the editor keeps working.
 
-Not yet: rename, find references, code actions and formatting, signature help, snippets in completions,
+Not yet: code actions, format selection / on save, signature help, snippets in completions,
 semantic highlighting, definitions outside the open folder (standard library, dependencies), server
 settings, and restarting a stopped server without reopening the folder.
 

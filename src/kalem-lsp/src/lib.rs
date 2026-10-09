@@ -10,10 +10,12 @@
 //!   (completion, hover, go to definition, diagnostics).
 
 mod client;
+mod edits;
 mod server;
 mod uri;
 
 pub use client::{encode, read_message, Client, LspError, Notification};
+pub use edits::{apply_edits, flatten};
 pub use lsp_types;
 pub use server::Server;
 pub use uri::{path_to_uri, uri_to_path};

@@ -12,7 +12,7 @@ use gpui_kit::component::{
     menu::DropdownMenu as _,
     resizable::{h_resizable, resizable_panel, v_resizable},
     tree::{tree, TreeItem, TreeState},
-    ActiveTheme as _, Disableable as _,
+    ActiveTheme as _, Disableable as _, Selectable as _,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -43,6 +43,10 @@ actions!(
         FindNext,
         FindPrev,
         FindNextFile,
+        FindReferences,
+        RenameSymbol,
+        FormatDocument,
+        CloseRename,
         StartDebugging,
         StopDebugging,
         DebugPause,
@@ -61,7 +65,12 @@ actions!(
         GitFetch,
         GitPull,
         GitPush,
+        GitSync,
+        GitLog,
         GitStashAll,
+        DockRight,
+        AutoHideRight,
+        CloseRight,
         ShowOutput,
         ShowTests,
         ShowFind,
@@ -187,6 +196,10 @@ enum GitOp {
     Fetch,
     Pull,
     Push,
+    /// Pull, then push (the "Sync" button).
+    Sync,
+    /// Print the commit graph in the Output panel.
+    Log,
     Checkout(String),
     StashPush,
     StashPop(String),
@@ -214,6 +227,12 @@ fn run_git_op(root: &Path, op: &GitOp) -> Result<String, VcsError> {
         GitOp::Fetch => git.fetch(root),
         GitOp::Pull => git.pull(root),
         GitOp::Push => git.push(root),
+        GitOp::Sync => {
+            let pulled = git.pull(root)?;
+            let pushed = git.push(root)?;
+            Ok(format!("{pulled}\n{pushed}").trim().to_string())
+        }
+        GitOp::Log => git.log(root),
         GitOp::Checkout(b) => git.checkout(root, b),
         GitOp::StashPush => git.stash_push(root, ""),
         GitOp::StashPop(n) => git.stash_pop(root, n),
@@ -237,6 +256,10 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-p", QuickOpen, None),
         KeyBinding::new("secondary-shift-f", ShowFind, None),
         KeyBinding::new("f3", FindNext, None),
+        KeyBinding::new("shift-f12", FindReferences, None),
+        KeyBinding::new("f2", RenameSymbol, None),
+        KeyBinding::new("shift-alt-f", FormatDocument, None),
+        KeyBinding::new("escape", CloseRename, Some("Rename")),
         KeyBinding::new("shift-f3", FindPrev, None),
         KeyBinding::new("alt-left", NavBack, None),
         KeyBinding::new("alt-right", NavForward, None),
@@ -327,6 +350,12 @@ pub struct Kalem {
     active: Option<usize>,
     sync_active: bool,
     right: Right,
+    /// The right dock is docked (true) or collapsed to an edge strip that slides open on click.
+    right_pinned: bool,
+    /// Auto-hide mode only: the panel is currently slid out over the editor.
+    right_open: bool,
+    /// False once the dock has been closed; View > Solution Explorer / Git Changes bring it back.
+    right_shown: bool,
     bottom: Bottom,
     region: Region,
     git: Result<Status, String>,
@@ -410,6 +439,8 @@ pub struct Kalem {
     cond_edit: Option<(String, u32)>,
     cond_input: Entity<InputState>,
     lsp: lsp::LspState,
+    rename: Option<lsp::RenameState>,
+    rename_input: Entity<InputState>,
     /// Watch expressions, evaluated whenever the program stops.
     watches: Vec<String>,
     watch_input: Entity<InputState>,
@@ -473,7 +504,17 @@ impl Kalem {
         let cond_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("Condition, e.g. i == 3 (Enter; empty clears)")
         });
+        let rename_input = cx.new(|cx| InputState::new(window, cx).placeholder("New name"));
         let dbg_subs = vec![
+            cx.subscribe_in(
+                &rename_input,
+                window,
+                |this, _, ev: &InputEvent, window, cx| {
+                    if matches!(ev, InputEvent::PressEnter { .. }) {
+                        this.commit_rename(window, cx);
+                    }
+                },
+            ),
             cx.subscribe_in(
                 &watch_input,
                 window,
@@ -500,6 +541,9 @@ impl Kalem {
             active: None,
             sync_active: true,
             right: Right::Explorer,
+            right_pinned: true,
+            right_open: false,
+            right_shown: true,
             bottom: Bottom::Output,
             region: Region::Editor,
             git: Err("No folder open".into()),
@@ -557,6 +601,8 @@ impl Kalem {
             cond_edit: None,
             cond_input,
             lsp: Default::default(),
+            rename: None,
+            rename_input,
             watches: Vec::new(),
             watch_input,
             _dbg_subs: dbg_subs,
@@ -754,6 +800,8 @@ impl Kalem {
                 .unwrap_or("");
                 this.git_note = if is_err {
                     Some((format!("{label} failed: {first}"), true))
+                } else if label == "log" {
+                    Some(("Commit graph is in the Output panel".to_string(), false))
                 } else if quiet {
                     None
                 } else {
@@ -965,13 +1013,30 @@ impl Kalem {
         }
     }
 
+    /// Select a tab of the right dock and make sure it can be seen: reopen a closed dock, slide
+    /// an auto-hidden one out.
+    fn reveal_right(&mut self, which: Right) {
+        self.right = which;
+        self.right_shown = true;
+        if !self.right_pinned {
+            self.right_open = true;
+        }
+    }
+
+    fn set_right_pinned(&mut self, pinned: bool, cx: &mut Context<Self>) {
+        self.right_pinned = pinned;
+        // Pinning docks it for good; un-pinning keeps it slid out until the user clicks away.
+        self.right_open = !pinned;
+        cx.notify();
+    }
+
     fn show_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.find_place == FindPlace::Hidden {
             self.find_place = FindPlace::Float;
         }
         match self.find_place {
             FindPlace::Bottom => self.bottom = Bottom::Find,
-            FindPlace::Right => self.right = Right::Find,
+            FindPlace::Right => self.reveal_right(Right::Find),
             _ => {}
         }
         self.find_input.update(cx, |s, cx| s.focus(window, cx));
@@ -982,7 +1047,7 @@ impl Kalem {
         self.find_place = place;
         match place {
             FindPlace::Bottom => self.bottom = Bottom::Find,
-            FindPlace::Right => self.right = Right::Find,
+            FindPlace::Right => self.reveal_right(Right::Find),
             _ => {
                 // Leaving a dock must not leave an empty tab selected.
                 if self.right == Right::Find {
@@ -2369,6 +2434,10 @@ impl Render for Kalem {
                     .menu("Find Next (F3)", Box::new(FindNext))
                     .menu("Find Previous (Shift+F3)", Box::new(FindPrev))
                     .menu("Find Next File", Box::new(FindNextFile))
+                    .separator()
+                    .menu("Find All References (Shift+F12)", Box::new(FindReferences))
+                    .menu("Rename Symbol (F2)", Box::new(RenameSymbol))
+                    .menu("Format Document (Shift+Alt+F)", Box::new(FormatDocument))
             }))
             .child(m("m-view", "View").dropdown_menu(move |m, w, cx| {
                 let names = theme_names.clone();
@@ -2773,12 +2842,28 @@ impl Render for Kalem {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ShowExplorer, _, cx| {
-                this.right = Right::Explorer;
+                this.reveal_right(Right::Explorer);
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ShowGit, _, cx| {
-                this.right = Right::Git;
+                this.reveal_right(Right::Git);
                 cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &DockRight, _, cx| this.set_right_pinned(true, cx)))
+            .on_action(
+                cx.listener(|this, _: &AutoHideRight, _, cx| this.set_right_pinned(false, cx)),
+            )
+            .on_action(cx.listener(|this, _: &CloseRight, _, cx| {
+                this.right_shown = false;
+                this.right_open = false;
+                cx.notify();
+            }))
+            .on_action(
+                cx.listener(|this, _: &GitSync, w, cx| this.git_op("sync", GitOp::Sync, w, cx)),
+            )
+            .on_action(cx.listener(|this, _: &GitLog, w, cx| {
+                this.bottom = Bottom::Output;
+                this.git_op("log", GitOp::Log, w, cx)
             }))
             .on_action(
                 cx.listener(|this, _: &GitFetch, w, cx| this.git_op("fetch", GitOp::Fetch, w, cx)),
@@ -2800,6 +2885,10 @@ impl Render for Kalem {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ShowFind, w, cx| this.show_find(w, cx)))
+            .on_action(cx.listener(|this, _: &FindReferences, _, cx| this.find_references(cx)))
+            .on_action(cx.listener(|this, _: &RenameSymbol, w, cx| this.start_rename(w, cx)))
+            .on_action(cx.listener(|this, _: &FormatDocument, _, cx| this.format_document(cx)))
+            .on_action(cx.listener(|this, _: &CloseRename, w, cx| this.close_rename(w, cx)))
             .on_action(cx.listener(|this, _: &FindNext, w, cx| this.find_step(1, false, w, cx)))
             .on_action(cx.listener(|this, _: &FindPrev, w, cx| this.find_step(-1, false, w, cx)))
             .on_action(cx.listener(|this, _: &FindNextFile, w, cx| this.find_step(1, true, w, cx)))
@@ -3106,65 +3195,117 @@ impl Render for Kalem {
                 // Branch picker + sync buttons.
                 let branch_name = st.branch.clone().unwrap_or_else(|| "(detached)".into());
                 let branches = self.branches.clone();
+                let tool = |id: &'static str, ic: &'static str, tip: &'static str| {
+                    Button::new(id)
+                        .ghost()
+                        .compact()
+                        .icon(icon(ic))
+                        .tooltip(tip)
+                        .disabled(busy.is_some())
+                };
                 let top = div()
                     .flex()
-                    .items_center()
+                    .flex_col()
                     .gap_1()
                     .px_1()
                     .py_1()
                     .child(
-                        Button::new("g-branch")
-                            .ghost()
-                            .compact()
-                            .icon(icon("git-branch"))
-                            .label(branch_name)
-                            .dropdown_caret(true)
-                            .dropdown_menu(move |mut m, _, _| {
-                                for b in &branches {
-                                    m = m.menu_with_check(
-                                        b.name.clone(),
-                                        b.current,
-                                        Box::new(CheckoutBranch(b.name.clone())),
-                                    );
-                                }
-                                m
-                            }),
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                div().flex_1().min_w_0().child(
+                                    Button::new("g-branch")
+                                        .outline()
+                                        .compact()
+                                        .w_full()
+                                        .child(
+                                            div()
+                                                .w_full()
+                                                .flex()
+                                                .items_center()
+                                                .justify_between()
+                                                .child(div().truncate().child(branch_name))
+                                                .child(
+                                                    icon("chevron-down").size_4().text_color(muted),
+                                                ),
+                                        )
+                                        .dropdown_menu(move |mut m, _, _| {
+                                            for b in &branches {
+                                                m = m.menu_with_check(
+                                                    b.name.clone(),
+                                                    b.current,
+                                                    Box::new(CheckoutBranch(b.name.clone())),
+                                                );
+                                            }
+                                            m
+                                        }),
+                                ),
+                            )
+                            .child(tool("g-fetch", "arrow-down", "Fetch").on_click(cx.listener(
+                                |this, _, w, cx| this.git_op("fetch", GitOp::Fetch, w, cx),
+                            )))
+                            .child(tool("g-pull", "arrow-down-to-line", "Pull").on_click(
+                                cx.listener(|this, _, w, cx| {
+                                    this.git_op("pull", GitOp::Pull, w, cx)
+                                }),
+                            ))
+                            .child(tool("g-push", "arrow-up-to-line", "Push").on_click(
+                                cx.listener(|this, _, w, cx| {
+                                    this.git_op("push", GitOp::Push, w, cx)
+                                }),
+                            ))
+                            .child(
+                                tool("g-sync", "refresh-cw", "Sync (Pull, then Push)").on_click(
+                                    cx.listener(|this, _, w, cx| {
+                                        this.git_op("sync", GitOp::Sync, w, cx)
+                                    }),
+                                ),
+                            )
+                            .child(
+                                Button::new("g-more")
+                                    .ghost()
+                                    .compact()
+                                    .icon(icon("ellipsis"))
+                                    .dropdown_menu(|m, _, _| {
+                                        m.menu("Refresh Status", Box::new(Refresh))
+                                            .separator()
+                                            .menu("Fetch", Box::new(GitFetch))
+                                            .menu("Pull", Box::new(GitPull))
+                                            .menu("Push", Box::new(GitPush))
+                                            .menu("Sync", Box::new(GitSync))
+                                            .separator()
+                                            .menu("Stash All Changes", Box::new(GitStashAll))
+                                            .menu("View All Commits", Box::new(GitLog))
+                                    }),
+                            ),
                     )
-                    .child(div().flex_1())
                     .child(
-                        Button::new("g-pull")
-                            .ghost()
-                            .compact()
-                            .icon(icon("arrow-down"))
-                            .label(ov.behind.to_string())
-                            .tooltip("Pull")
-                            .disabled(busy.is_some())
-                            .on_click(cx.listener(|this, _, w, cx| {
-                                this.git_op("pull", GitOp::Pull, w, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new("g-push")
-                            .ghost()
-                            .compact()
-                            .icon(icon("arrow-up"))
-                            .label(ov.ahead.to_string())
-                            .tooltip("Push")
-                            .disabled(busy.is_some())
-                            .on_click(cx.listener(|this, _, w, cx| {
-                                this.git_op("push", GitOp::Push, w, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new("g-fetch")
-                            .ghost()
-                            .compact()
-                            .icon(icon("refresh-cw"))
-                            .tooltip("Fetch")
-                            .disabled(busy.is_some())
-                            .on_click(cx.listener(|this, _, w, cx| {
-                                this.git_op("fetch", GitOp::Fetch, w, cx)
-                            })),
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .px_1()
+                            .text_sm()
+                            .child(icon("arrow-up-down").size_4().text_color(muted))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .child(format!("{} / {}", ov.ahead, ov.behind)),
+                            )
+                            .child(
+                                div()
+                                    .id("g-log")
+                                    .cursor_pointer()
+                                    .text_color(accent)
+                                    .hover(|d| d.underline())
+                                    .child("View all commits")
+                                    .on_click(cx.listener(|this, _, w, cx| {
+                                        this.bottom = Bottom::Output;
+                                        this.git_op("log", GitOp::Log, w, cx)
+                                    })),
+                            ),
                     );
 
                 // Commit box.
@@ -3344,6 +3485,7 @@ impl Render for Kalem {
         } else {
             border
         };
+        let pinned = self.right_pinned;
         let right_dock = div()
             .size_full()
             .flex()
@@ -3357,11 +3499,65 @@ impl Render for Kalem {
                     cx.notify();
                 }),
             )
-            .child(div().px_2().py_1().text_sm().child(match self.right {
-                Right::Explorer => "Solution Explorer",
-                Right::Git => "Git Changes",
-                Right::Find => "Find and Replace",
-            }))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .h(px(30.))
+                    .pl_2()
+                    .pr_1()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_sm()
+                            .child(match self.right {
+                                Right::Explorer => "Solution Explorer".to_string(),
+                                Right::Git => {
+                                    match self.git.as_ref().ok().and_then(|s| s.branch.clone()) {
+                                        Some(b) => format!("Git Changes - {b}"),
+                                        None => "Git Changes".to_string(),
+                                    }
+                                }
+                                Right::Find => "Find and Replace".to_string(),
+                            }),
+                    )
+                    .child(
+                        Button::new("r-menu")
+                            .ghost()
+                            .compact()
+                            .icon(icon("chevron-down"))
+                            .dropdown_menu(move |m, _, _| {
+                                m.menu_with_check("Dock", pinned, Box::new(DockRight))
+                                    .menu_with_check("Auto Hide", !pinned, Box::new(AutoHideRight))
+                                    .separator()
+                                    .menu("Close", Box::new(CloseRight))
+                            }),
+                    )
+                    .child(
+                        Button::new("r-pin")
+                            .ghost()
+                            .compact()
+                            .icon(icon(if pinned { "pin" } else { "pin-off" }))
+                            .tooltip(if pinned { "Auto Hide" } else { "Keep Docked" })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.set_right_pinned(!pinned, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("r-close")
+                            .ghost()
+                            .compact()
+                            .icon(icon("x"))
+                            .tooltip("Close")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.right_shown = false;
+                                this.right_open = false;
+                                cx.notify();
+                            })),
+                    ),
+            )
             .child(
                 div().flex_1().min_h_0().child(match self.right {
                     Right::Explorer => explorer.into_any_element(),
@@ -3453,6 +3649,8 @@ impl Render for Kalem {
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
                     this.region = Region::Editor;
+                    // An auto-hidden panel slides away as soon as the user goes back to work.
+                    this.right_open = false;
                     cx.notify();
                 }),
             )
@@ -3771,22 +3969,105 @@ impl Render for Kalem {
         });
 
         let overlay = self.find_overlay(window, cx);
+        let rename = self.rename_overlay(cx);
+
+        // The top row: the editor, and the right dock beside it (docked) or slid over it from an
+        // edge strip (auto-hide).
+        let top_row = if !self.right_shown {
+            editor_area.into_any_element()
+        } else if self.right_pinned {
+            h_resizable("top")
+                .child(resizable_panel().child(editor_area))
+                .child(resizable_panel().size(px(320.)).child(right_dock))
+                .into_any_element()
+        } else {
+            let strip_btn =
+                |id: &'static str, ic: &'static str, tip: &'static str, which: Right| {
+                    let on = self.right == which && self.right_open;
+                    Button::new(id)
+                        .ghost()
+                        .compact()
+                        .icon(icon(ic))
+                        .tooltip(tip)
+                        .selected(on)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if this.right == which && this.right_open {
+                                this.right_open = false;
+                            } else {
+                                this.right = which;
+                                this.right_open = true;
+                            }
+                            cx.notify();
+                        }))
+                };
+            let strip = div()
+                .w(px(34.))
+                .flex_none()
+                .h_full()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap_1()
+                .py_1()
+                .border_l_1()
+                .border_color(border)
+                .child(strip_btn(
+                    "s-explorer",
+                    "folder",
+                    "Solution Explorer",
+                    Right::Explorer,
+                ))
+                .child(strip_btn("s-git", "git-branch", "Git Changes", Right::Git))
+                .when(self.find_place == FindPlace::Right, |d| {
+                    d.child(strip_btn(
+                        "s-find",
+                        "search",
+                        "Find and Replace",
+                        Right::Find,
+                    ))
+                });
+            div()
+                .size_full()
+                .flex()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .relative()
+                        .child(editor_area)
+                        .when(self.right_open, |d| {
+                            d.child(
+                                div()
+                                    .absolute()
+                                    .top_0()
+                                    .right_0()
+                                    .bottom_0()
+                                    .w(px(320.))
+                                    .occlude()
+                                    .bg(theme.background)
+                                    .border_l_1()
+                                    .border_color(accent)
+                                    .shadow_lg()
+                                    .child(right_dock),
+                            )
+                        }),
+                )
+                .child(strip)
+                .into_any_element()
+        };
+
         root.child(
             div().flex_1().min_h_0().child(
                 v_resizable("main")
-                    .child(
-                        resizable_panel().child(
-                            h_resizable("top")
-                                .child(resizable_panel().child(editor_area))
-                                .child(resizable_panel().size(px(320.)).child(right_dock)),
-                        ),
-                    )
+                    .child(resizable_panel().child(top_row))
                     .child(resizable_panel().size(px(220.)).child(bottom)),
             ),
         )
         .child(status)
         .child(mouse_up_probe(cx.entity(), Kalem::tab_mouse_up))
         .children(quick)
+        .children(rename)
         .children(overlay)
     }
 }
