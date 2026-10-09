@@ -113,3 +113,6 @@ scratch/
 
 # Packaging output
 dist/
+
+# UI spikes have their own workspace
+/spikes/target
