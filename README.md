@@ -59,6 +59,7 @@ Prebuilt downloads for Windows, macOS and Linux are attached to each
 ## Documentation
 
 - [Project structure](docs/PROJECT_STRUCTURE.md)
+- [Solutions and the .kalem file](docs/SOLUTION_FORMAT.md)
 - [Overview](docs/OVERVIEW.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [UI direction](docs/UI_DIRECTION.md)

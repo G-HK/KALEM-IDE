@@ -30,6 +30,7 @@ version = "0.0.1"
 dependencies = [
  "kalem-core",
  "kalem-lang",
+ "kalem-solution",
  "kalem-test",
  "kalem-vcs",
 ]
@@ -55,6 +56,15 @@ name = "kalem-lsp"
 version = "0.0.1"
 
 [[package]]
+name = "kalem-solution"
+version = "0.0.1"
+dependencies = [
+ "quick-xml",
+ "serde",
+ "toml",
+]
+
+[[package]]
 name = "kalem-test"
 version = "0.0.1"
 dependencies = [
@@ -68,6 +78,7 @@ dependencies = [
  "kalem",
  "kalem-core",
  "kalem-lang",
+ "kalem-solution",
  "kalem-test",
  "kalem-vcs",
 ]
