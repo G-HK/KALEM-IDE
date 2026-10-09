@@ -3,9 +3,25 @@
 A multi-language, cross-platform IDE with a Visual Studio-style workflow, written in Rust.
 *Kalem* is Turkish for "pen".
 
-> **Status: very early.** Today this repository contains the project skeleton: a command
-> registry, language-pack loading and a small CLI. The editor UI, LSP client and debugger
-> UI are on the [roadmap](docs/ROADMAP.md).
+> **Status: early, but usable.** There is a working desktop IDE (GPUI): Solution Explorer, tabbed
+> editor with syntax highlighting, Find and Replace in Files, a Git panel with side-by-side diffs,
+> build / run / test tasks, a debugger (DAP) and language-server features (LSP). Tabs can be torn off
+> into their own windows. Verified on Linux; Windows and macOS builds are still being exercised.
+> See the [roadmap](docs/ROADMAP.md) for what is done and what is next.
+
+## What works today
+
+- **Editor:** tabs coloured per project, syntax highlighting, Quick Open (Ctrl+P), Find in Files with
+  regex, replace and Find Next / Previous (F3 / Shift+F3), light and dark themes (Black Panda palette).
+- **Solution Explorer:** `.kalem`, `.slnx` / `.sln`, workspace manifests or a plain folder; sync with the
+  active document; source-control badges.
+- **Build, run, test:** the language pack's `[tasks]` commands, streamed to Output; Test Results panel.
+- **Git:** branches, stage / unstage, commit, amend, push / pull / fetch, stashes, side-by-side diff view.
+- **Debugger:** breakpoints (F9), step / continue (F5, F10, F11), call stack, variables you can expand,
+  watch expressions, conditional breakpoints. See [DEBUGGING.md](docs/DEBUGGING.md).
+- **Language servers:** diagnostics, completion, hover and go to definition through the server named in
+  the language pack. See [LSP.md](docs/LSP.md).
+- **Windows:** drag a tab out to get a new window, or drop it into another one.
 
 ## Goals
 
@@ -37,11 +53,13 @@ adapter = "kotlin-debug-adapter"
 ```
 
 Debug adapters can be overridden per OS (`[debug.windows]`, `[debug.macos]`, `[debug.linux]`).
-Language servers and debug adapters are downloaded on first use, not bundled.
+Language servers and debug adapters are not bundled: install them and keep them on your `PATH`
+(see [LSP.md](docs/LSP.md) and [DEBUGGING.md](docs/DEBUGGING.md)); automatic download is planned.
 
 ## Try it
 
 ```
+cargo run -p kalem-ui        # the IDE (needs the GPUI system libraries)
 cargo run -p kalem -- help
 cargo run -p kalem -- languages.list
 cargo run -p kalem -- vcs.status .
@@ -66,6 +84,7 @@ Prebuilt downloads for Windows, macOS and Linux are attached to each
 - [Debug metadata and test overview](docs/TESTING_AND_DEBUG_PANELS.md)
 - [Roadmap](docs/ROADMAP.md)
 - [Debugging on every platform](docs/DEBUGGING.md)
+- [Language servers (LSP)](docs/LSP.md)
 - [Version control and hosting platforms](docs/VERSION_CONTROL.md)
 
 ## License
