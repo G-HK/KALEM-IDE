@@ -1,7 +1,7 @@
 # Themes
 
 Kalem has two basic palettes, **Light** and **Dark**, in the built-in theme **Kalem** (`themes/kalem.toml`).
-The Light palette is the Black Panda palette. Every theme, built in or yours, carries its own `[light]`
+The Light palette is the Black Panda palette (Ink #0A0A0A, Paper #FFFFFF, BambooDeep #6FAA28 as accent). Every theme, built in or yours, carries its own `[light]`
 and `[dark]` palette, and **View > Appearance** picks Light, Dark or System.
 
 ## Adding your own theme

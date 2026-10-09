@@ -4,24 +4,25 @@
 name = "Kalem"
 
 # --- Light: the Black Panda palette.
-# PLACEHOLDER VALUES: replace with the official Black Panda brand colours.
+#   Ink #0A0A0A, Paper #FFFFFF, PaperTint #F7F7F4, CardTint #ECECE6, Divider #D8D8D1,
+#   TextMuted #6A6A63, Bamboo #B9FF66 (brand accent), BambooDeep #6FAA28 (accent readable on light).
 [light]
-background = "#ffffff"
-panel = "#f4f4f5"
-foreground = "#111111"
-muted_foreground = "#6b6b70"
-border = "#d8d8dc"
-list_active = "#e6e6ea"
-accent = "#111111"        # focus border, active tab line
-success = "#2e7d32"
-warning = "#b26a00"
-danger = "#c62828"
-folder = "#8a8a90"
-project = "#111111"
-solution = "#111111"
-lock = "#6b6b70"
+background = "#FFFFFF"     # Paper
+panel = "#F7F7F4"          # PaperTint
+foreground = "#0A0A0A"     # Ink
+muted_foreground = "#6A6A63"  # TextMuted
+border = "#D8D8D1"         # Divider
+list_active = "#ECECE6"    # CardTint
+accent = "#6FAA28"         # BambooDeep: focus border, active tab line (Bamboo itself is too pale on white)
+success = "#1F8A5B"
+warning = "#E0A100"
+danger = "#D7263D"
+folder = "#6A6A63"
+project = "#2A6FDB"        # Info
+solution = "#6FAA28"
+lock = "#6A6A63"
 [light.badges]            # per file type; keys are the badge labels in lower case
-yml = "#c62828"
+yml = "#D7263D"
 
 # --- Dark: basic dark.
 [dark]

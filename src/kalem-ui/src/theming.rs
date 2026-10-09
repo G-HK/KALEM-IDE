@@ -45,7 +45,7 @@ pub fn apply(theme: &KalemTheme, dark: bool, cx: &mut App) -> Palette {
         t.primary = c("accent");
         t.primary_hover = c("accent");
         t.primary_active = c("accent");
-        t.primary_foreground = c("background");
+        t.primary_foreground = readable_on(c("accent"), c("background"), c("foreground"));
         t.ring = c("accent");
         t.caret = c("foreground");
         t.link = c("accent");
@@ -70,4 +70,28 @@ pub fn apply(theme: &KalemTheme, dark: bool, cx: &mut App) -> Palette {
         t.danger = c("danger");
     });
     p
+}
+
+/// Whichever of two colours reads better on `bg` (WCAG contrast ratio).
+pub fn readable_on(bg: Hsla, a: Hsla, b: Hsla) -> Hsla {
+    fn lum(c: Hsla) -> f32 {
+        let c = c.to_rgb();
+        let f = |v: f32| {
+            if v <= 0.03928 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * f(c.r) + 0.7152 * f(c.g) + 0.0722 * f(c.b)
+    }
+    let ratio = |x: Hsla| {
+        let (l1, l2) = (lum(bg).max(lum(x)), lum(bg).min(lum(x)));
+        (l1 + 0.05) / (l2 + 0.05)
+    };
+    if ratio(a) >= ratio(b) {
+        a
+    } else {
+        b
+    }
 }

@@ -41,6 +41,12 @@ svgs!(
     "bug",
     "square",
     "circle-check",
+    "arrow-down",
+    "arrow-up",
+    "minus",
+    "git-branch",
+    "archive",
+    "trash",
 );
 
 pub fn icon(name: &str) -> Icon {

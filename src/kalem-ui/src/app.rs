@@ -1,8 +1,9 @@
 use crate::icons::icon;
 use crate::theming::{self, rgba};
 use gpui_kit::component::{
-    button::{Button, ButtonVariants as _},
-    input::{self, Editor, EditorState, Input, InputEvent, InputState},
+    button::{Button, ButtonCustomVariant, ButtonVariants as _},
+    checkbox::Checkbox,
+    input::{self, Editor, EditorState, Input, InputEvent, InputState, Textarea, TextareaState},
     list::ListItem,
     menu::DropdownMenu as _,
     resizable::{h_resizable, resizable_panel, v_resizable},
@@ -14,7 +15,9 @@ use gpui_kit::*;
 use kalem_core::explorer::Node;
 use kalem_test::{Outcome, TestRun};
 use kalem_theme::{Mode, Palette, Settings, Theme as KalemTheme};
-use kalem_vcs::{ChangeKind, Status};
+use kalem_vcs::git::{Branch, GitCli, Stash};
+use kalem_vcs::overview::ChangesOverview;
+use kalem_vcs::{ChangeKind, Status, VcsError};
 use kalem_workspace::kinds::{badge_for, is_image, project_kind, ProjectKind};
 use kalem_workspace::tasks::{spawn, Config, RunningTask, TaskEvent, TaskKind};
 use kalem_workspace::{language_for, quick_open, Workspace};
@@ -34,6 +37,10 @@ actions!(
         Refresh,
         ShowExplorer,
         ShowGit,
+        GitFetch,
+        GitPull,
+        GitPush,
+        GitStashAll,
         ShowOutput,
         ShowTests,
         Build,
@@ -62,6 +69,64 @@ pub struct SetTheme(pub usize);
 #[derive(Clone, PartialEq, Action)]
 #[action(namespace = kalem, no_json)]
 pub struct SetStartup(pub usize);
+
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = kalem, no_json)]
+pub struct CheckoutBranch(pub String);
+
+/// A git write operation, run off the UI thread.
+enum GitOp {
+    Stage(Vec<String>),
+    Unstage(Vec<String>),
+    StageAll,
+    UnstageAll,
+    Commit {
+        all: bool,
+        message: String,
+        amend: bool,
+    },
+    Fetch,
+    Pull,
+    Push,
+    Checkout(String),
+    StashPush,
+    StashPop(String),
+    StashDrop(String),
+}
+
+fn run_git_op(root: &Path, op: &GitOp) -> Result<String, VcsError> {
+    let git = GitCli;
+    let none = |r: Result<(), VcsError>| r.map(|_| String::new());
+    match op {
+        GitOp::Stage(p) => none(git.stage(root, p)),
+        GitOp::Unstage(p) => none(git.unstage(root, p)),
+        GitOp::StageAll => none(git.stage_all(root)),
+        GitOp::UnstageAll => none(git.unstage_all(root)),
+        GitOp::Commit {
+            all,
+            message,
+            amend,
+        } => {
+            if *all {
+                git.stage_all(root)?;
+            }
+            git.commit(root, message, *amend)
+        }
+        GitOp::Fetch => git.fetch(root),
+        GitOp::Pull => git.pull(root),
+        GitOp::Push => git.push(root),
+        GitOp::Checkout(b) => git.checkout(root, b),
+        GitOp::StashPush => git.stash_push(root, ""),
+        GitOp::StashPop(n) => git.stash_pop(root, n),
+        GitOp::StashDrop(n) => git.stash_drop(root, n),
+    }
+}
+
+fn vcs_error_text(e: &VcsError) -> String {
+    match e {
+        VcsError::NotInstalled(s) | VcsError::Failed(s) | VcsError::Parse(s) => s.clone(),
+    }
+}
 
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
@@ -127,6 +192,14 @@ pub struct Kalem {
     bottom: Bottom,
     region: Region,
     git: Result<Status, String>,
+    commit_msg: Entity<TextareaState>,
+    amend: bool,
+    branches: Vec<Branch>,
+    stashes: Vec<Stash>,
+    git_busy: Option<&'static str>,
+    /// Last git result for the panel: (text, is_error).
+    git_note: Option<(String, bool)>,
+    _msg_sub: Subscription,
     tests: TestRun,
     message: Option<String>,
     focus: FocusHandle,
@@ -173,6 +246,14 @@ impl Kalem {
             kalem_theme::load_all(cfg.as_ref().map(|d| d.join("themes")).as_deref());
         let settings = Settings::load(cfg.as_deref());
         let tree = cx.new(|cx| TreeState::new(cx));
+        let commit_msg =
+            cx.new(|cx| TextareaState::new(window, cx).placeholder("Enter a message <Required>"));
+        // The Commit button's enabled state depends on the message, so redraw on every edit.
+        let msg_sub = cx.subscribe_in(&commit_msg, window, |_, _, ev: &InputEvent, _, cx| {
+            if matches!(ev, InputEvent::Change) {
+                cx.notify();
+            }
+        });
         let mut me = Self {
             ws: None,
             tree,
@@ -183,6 +264,13 @@ impl Kalem {
             bottom: Bottom::Output,
             region: Region::Editor,
             git: Err("No folder open".into()),
+            commit_msg,
+            amend: false,
+            branches: Vec::new(),
+            stashes: Vec::new(),
+            git_busy: None,
+            git_note: None,
+            _msg_sub: msg_sub,
             tests: TestRun { cases: Vec::new() },
             message: errors.first().cloned(),
             focus: cx.focus_handle(),
@@ -308,6 +396,8 @@ impl Kalem {
     fn refresh(&mut self, cx: &mut Context<Self>) {
         if let Some(ws) = &self.ws {
             self.git = ws.git_status().map_err(|e| format!("{e:?}"));
+            self.branches = GitCli.branches(&ws.root).unwrap_or_default();
+            self.stashes = GitCli.stashes(&ws.root).unwrap_or_default();
             self.tests = ws.test_results();
             let mut map = HashMap::new();
             if let Ok(st) = &self.git {
@@ -320,6 +410,114 @@ impl Kalem {
             self.changes = Rc::new(map);
         }
         cx.notify();
+    }
+
+    /// Run a git write operation on a background thread, then refresh the panel.
+    fn git_op(
+        &mut self,
+        label: &'static str,
+        op: GitOp,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.git_busy.is_some() {
+            return;
+        }
+        let Some(ws) = &self.ws else { return };
+        let root = ws.root.clone();
+        self.git_busy = Some(label);
+        self.git_note = None;
+        let is_commit = matches!(op, GitOp::Commit { .. });
+        let quiet = matches!(
+            op,
+            GitOp::Stage(_) | GitOp::Unstage(_) | GitOp::StageAll | GitOp::UnstageAll
+        );
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move { run_git_op(&root, &op) })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.git_busy = None;
+                let (text, is_err) = match &res {
+                    Ok(t) => (t.clone(), false),
+                    Err(e) => (vcs_error_text(e), true),
+                };
+                if !quiet {
+                    this.output.push(format!("> git {label}"));
+                    this.output.extend(text.lines().map(str::to_string));
+                    if is_err {
+                        this.output.push(format!("git {label} failed"));
+                    }
+                }
+                if is_commit && !is_err {
+                    this.amend = false;
+                    this.commit_msg
+                        .update(cx, |m, cx| m.set_value("", window, cx));
+                }
+                // Errors: show the line that says what went wrong; the full text is in Output.
+                let first = if is_err {
+                    text.lines()
+                        .find(|l| {
+                            let l = l.trim_start();
+                            l.starts_with("error:")
+                                || l.starts_with("fatal:")
+                                || l.starts_with("! ")
+                        })
+                        .map(|l| l.trim_start().trim_start_matches("error: "))
+                } else {
+                    None
+                }
+                .or_else(|| text.lines().find(|l| !l.trim().is_empty()))
+                .unwrap_or("");
+                this.git_note = if is_err {
+                    Some((format!("{label} failed: {first}"), true))
+                } else if quiet {
+                    None
+                } else {
+                    Some((
+                        if first.is_empty() {
+                            format!("{label}: done")
+                        } else {
+                            format!("{label}: {first}")
+                        },
+                        false,
+                    ))
+                };
+                this.refresh(cx);
+            });
+        })
+        .detach();
+    }
+
+    fn set_amend(&mut self, on: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.amend = on;
+        // Like Visual Studio: amending prefills the previous message.
+        if on && self.commit_msg.read(cx).value().trim().is_empty() {
+            if let Some(ws) = &self.ws {
+                if let Ok(last) = GitCli.last_commit_message(&ws.root) {
+                    self.commit_msg
+                        .update(cx, |m, cx| m.set_value(last, window, cx));
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn commit_click(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Ok(st) = &self.git else { return };
+        let ov = ChangesOverview::from_status(st);
+        let message = self.commit_msg.read(cx).value().to_string();
+        if !ov.commit_button(&message, self.amend).enabled {
+            return;
+        }
+        let op = GitOp::Commit {
+            all: ov.staged == 0,
+            message,
+            amend: self.amend,
+        };
+        self.git_op("commit", op, window, cx);
     }
 
     fn pick_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -705,7 +903,6 @@ fn panel_tab(
     fg: Hsla,
     muted: Hsla,
     bg_active: Hsla,
-    bg_inactive: Hsla,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     // The active tab hangs off the panel border like in Visual Studio: it repeats the border on
@@ -726,7 +923,12 @@ fn panel_tab(
         } else {
             gpui_kit::transparent_black()
         })
-        .bg(if active { bg_active } else { bg_inactive })
+        .bg(if active {
+            bg_active
+        } else {
+            // Transparent: a filled inactive tab would paint over the frame's bottom line.
+            gpui_kit::transparent_black()
+        })
         .text_color(if active { fg } else { muted })
         .child(label)
         .on_click(on_click)
@@ -804,6 +1006,12 @@ impl Render for Kalem {
             .child(m("m-git", "Git").dropdown_menu(|m, _, _| {
                 m.menu("Refresh Status", Box::new(Refresh))
                     .menu("Show Git Changes", Box::new(ShowGit))
+                    .separator()
+                    .menu("Fetch", Box::new(GitFetch))
+                    .menu("Pull", Box::new(GitPull))
+                    .menu("Push", Box::new(GitPush))
+                    .separator()
+                    .menu("Stash All Changes", Box::new(GitStashAll))
             }))
             .child(m("m-project", "Project").dropdown_menu({
                 let names = projects.clone();
@@ -1073,6 +1281,21 @@ impl Render for Kalem {
                 this.right = Right::Git;
                 cx.notify();
             }))
+            .on_action(
+                cx.listener(|this, _: &GitFetch, w, cx| this.git_op("fetch", GitOp::Fetch, w, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &GitPull, w, cx| this.git_op("pull", GitOp::Pull, w, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &GitPush, w, cx| this.git_op("push", GitOp::Push, w, cx)),
+            )
+            .on_action(cx.listener(|this, _: &GitStashAll, w, cx| {
+                this.git_op("stash", GitOp::StashPush, w, cx)
+            }))
+            .on_action(cx.listener(|this, a: &CheckoutBranch, w, cx| {
+                this.git_op("checkout", GitOp::Checkout(a.0.clone()), w, cx)
+            }))
             .on_action(cx.listener(|this, _: &ShowOutput, _, cx| {
                 this.bottom = Bottom::Output;
                 cx.notify();
@@ -1256,6 +1479,7 @@ impl Render for Kalem {
             );
 
         // ------------------------------------------------------ Git Changes
+        let busy = self.git_busy;
         let git_panel = match &self.git {
             Err(e) => div()
                 .p_2()
@@ -1263,6 +1487,9 @@ impl Render for Kalem {
                 .child(e.clone())
                 .into_any_element(),
             Ok(st) => {
+                let ov = ChangesOverview::from_status(st);
+                let message = self.commit_msg.read(cx).value().to_string();
+                let commit_btn = ov.commit_button(&message, self.amend);
                 let colour = |class: u8| match class {
                     0 => warning_c,
                     1 => success_c,
@@ -1270,32 +1497,82 @@ impl Render for Kalem {
                     _ => muted,
                 };
                 let v = cx.entity();
-                let row = move |id: usize, path: String, k: ChangeKind| {
+
+                // One changed file: [letter] name dir ............ [+/-]
+                let row = |id: usize, path: String, k: ChangeKind, staged: bool| {
                     let (letter, class) = badge(k);
-                    let p = path.clone();
-                    let v = v.clone();
+                    let (dir, name) = match path.trim_end_matches('/').rsplit_once('/') {
+                        Some((d, n)) => (format!("{d}/"), n.to_string()),
+                        None => (String::new(), path.trim_end_matches('/').to_string()),
+                    };
+                    let (open, act) = (v.clone(), v.clone());
+                    let p_open = path.clone();
                     div()
                         .id(("chg", id))
+                        .group("chg-row")
                         .flex()
-                        .gap_2()
-                        .px_2()
+                        .items_center()
+                        .pr_1()
                         .text_sm()
-                        .cursor_pointer()
                         .hover(move |d| d.bg(list_active))
-                        .child(div().w(px(14.)).text_color(colour(class)).child(letter))
-                        .child(path)
-                        .on_click(move |_, window, cx| {
-                            let p = p.clone();
-                            v.update(cx, |this, cx| this.open_file(&p, window, cx));
-                        })
+                        .child(
+                            div()
+                                .id(("chg-open", id))
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .px_2()
+                                .cursor_pointer()
+                                .child(
+                                    div()
+                                        .w(px(14.))
+                                        .flex_none()
+                                        .text_color(colour(class))
+                                        .child(letter),
+                                )
+                                .child(div().flex_none().child(if path.ends_with('/') {
+                                    format!("{name}/")
+                                } else {
+                                    name
+                                }))
+                                .child(div().truncate().text_xs().text_color(muted).child(dir))
+                                .on_click(move |_, window, cx| {
+                                    let p = p_open.clone();
+                                    open.update(cx, |this, cx| this.open_file(&p, window, cx));
+                                }),
+                        )
+                        .child(
+                            Button::new(("chg-act", id))
+                                .ghost()
+                                .compact()
+                                .icon(icon(if staged { "minus" } else { "plus" }))
+                                .tooltip(if staged { "Unstage" } else { "Stage" })
+                                .on_click(move |_, window, cx| {
+                                    let paths = vec![path.clone()];
+                                    act.update(cx, |this, cx| {
+                                        let op = if staged {
+                                            GitOp::Unstage(paths)
+                                        } else {
+                                            GitOp::Stage(paths)
+                                        };
+                                        this.git_op("stage", op, window, cx)
+                                    });
+                                }),
+                        )
                 };
-                let head = |t: String| {
+                let head = |t: String, action: Option<AnyElement>| {
                     div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
                         .px_2()
-                        .pt_1()
+                        .pt_2()
                         .text_xs()
                         .font_weight(FontWeight::BOLD)
                         .child(t)
+                        .children(action)
                 };
                 let staged: Vec<_> = st
                     .entries
@@ -1307,40 +1584,251 @@ impl Render for Kalem {
                     .iter()
                     .filter_map(|e| e.unstaged.map(|k| (e, k)))
                     .collect();
-                div()
-                    .id("git-scroll")
-                    .size_full()
-                    .overflow_y_scroll()
-                    .child(div().px_2().py_1().text_sm().child(format!(
-                        "{}{}  ahead {}  behind {}",
-                        st.branch.clone().unwrap_or_else(|| "(detached)".into()),
-                        st.upstream.as_ref().map(|u| format!(" -> {u}")).unwrap_or_default(),
-                        st.ahead,
-                        st.behind
-                    )))
-                    .child(head(format!("Staged ({})", staged.len())))
-                    .children(
-                        staged
-                            .iter()
-                            .enumerate()
-                            .map(|(i, (e, k))| row(i, e.path.clone(), *k)),
+
+                // Branch picker + sync buttons.
+                let branch_name = st.branch.clone().unwrap_or_else(|| "(detached)".into());
+                let branches = self.branches.clone();
+                let top = div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_1()
+                    .py_1()
+                    .child(
+                        Button::new("g-branch")
+                            .ghost()
+                            .compact()
+                            .icon(icon("git-branch"))
+                            .label(branch_name)
+                            .dropdown_caret(true)
+                            .dropdown_menu(move |mut m, _, _| {
+                                for b in &branches {
+                                    m = m.menu_with_check(
+                                        b.name.clone(),
+                                        b.current,
+                                        Box::new(CheckoutBranch(b.name.clone())),
+                                    );
+                                }
+                                m
+                            }),
                     )
-                    .child(head(format!("Changes ({})", changes_l.len())))
-                    .children(
-                        changes_l
-                            .iter()
-                            .enumerate()
-                            .map(|(i, (e, k))| row(10_000 + i, e.path.clone(), *k)),
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("g-pull")
+                            .ghost()
+                            .compact()
+                            .icon(icon("arrow-down"))
+                            .label(ov.behind.to_string())
+                            .tooltip("Pull")
+                            .disabled(busy.is_some())
+                            .on_click(cx.listener(|this, _, w, cx| {
+                                this.git_op("pull", GitOp::Pull, w, cx)
+                            })),
                     )
-                    .when(staged.is_empty() && changes_l.is_empty(), |d| {
-                        d.child(div().p_2().text_color(muted).child("Working tree clean"))
+                    .child(
+                        Button::new("g-push")
+                            .ghost()
+                            .compact()
+                            .icon(icon("arrow-up"))
+                            .label(ov.ahead.to_string())
+                            .tooltip("Push")
+                            .disabled(busy.is_some())
+                            .on_click(cx.listener(|this, _, w, cx| {
+                                this.git_op("push", GitOp::Push, w, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("g-fetch")
+                            .ghost()
+                            .compact()
+                            .icon(icon("refresh-cw"))
+                            .tooltip("Fetch")
+                            .disabled(busy.is_some())
+                            .on_click(cx.listener(|this, _, w, cx| {
+                                this.git_op("fetch", GitOp::Fetch, w, cx)
+                            })),
+                    );
+
+                // Commit box.
+                let note = busy
+                    .map(|l| (format!("{l}..."), false))
+                    .or_else(|| self.git_note.clone());
+                let commit = div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .px_2()
+                    .child(Textarea::new(&self.commit_msg).h(px(72.)))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                Button::new("g-commit")
+                                    .custom(
+                                        ButtonCustomVariant::new(cx)
+                                            .color(accent)
+                                            .foreground(theming::readable_on(
+                                                accent,
+                                                theme.background,
+                                                theme.foreground,
+                                            ))
+                                            .hover(accent.opacity(0.85))
+                                            .active(accent.opacity(0.7)),
+                                    )
+                                    .compact()
+                                    .label(commit_btn.label)
+                                    .disabled(!commit_btn.enabled || busy.is_some())
+                                    .when_some(commit_btn.reason, |b, r| b.tooltip(r))
+                                    .on_click(
+                                        cx.listener(|this, _, w, cx| this.commit_click(w, cx)),
+                                    ),
+                            )
+                            .child(
+                                Checkbox::new("g-amend")
+                                    .label("Amend")
+                                    .checked(self.amend)
+                                    .on_click({
+                                        let v = v.clone();
+                                        move |on, w, cx| {
+                                            let on = *on;
+                                            v.update(cx, |this, cx| this.set_amend(on, w, cx));
+                                        }
+                                    }),
+                            ),
+                    )
+                    .when_some(note, |d, (text, is_err)| {
+                        d.child(
+                            div()
+                                .text_xs()
+                                .text_color(if is_err { danger_c } else { muted })
+                                .child(text),
+                        )
+                    });
+
+                let section_btn = |id: &'static str, ic: &'static str, tip: &'static str| {
+                    Button::new(id)
+                        .ghost()
+                        .compact()
+                        .icon(icon(ic))
+                        .tooltip(tip)
+                        .disabled(busy.is_some())
+                };
+                let unstage_all = section_btn("g-unstage-all", "minus", "Unstage All")
+                    .on_click(cx.listener(|this, _, w, cx| {
+                        this.git_op("unstage", GitOp::UnstageAll, w, cx)
+                    }))
+                    .into_any_element();
+                let stage_all = section_btn("g-stage-all", "plus", "Stage All")
+                    .on_click(
+                        cx.listener(|this, _, w, cx| this.git_op("stage", GitOp::StageAll, w, cx)),
+                    )
+                    .into_any_element();
+                let stash_all = section_btn("g-stash-all", "archive", "Stash All Changes")
+                    .on_click(
+                        cx.listener(|this, _, w, cx| this.git_op("stash", GitOp::StashPush, w, cx)),
+                    )
+                    .into_any_element();
+
+                let stash_rows: Vec<_> = self
+                    .stashes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| {
+                        let (pop_name, drop_name) = (s.name.clone(), s.name.clone());
+                        let (pv, dv) = (v.clone(), v.clone());
+                        div()
+                            .id(("stash", i))
+                            .flex()
+                            .items_center()
+                            .pl_2()
+                            .pr_1()
+                            .text_sm()
+                            .hover(move |d| d.bg(list_active))
+                            .child(div().flex_1().min_w_0().truncate().child(format!(
+                                "{} {}",
+                                s.name,
+                                s.message.split_once(": ").map(|x| x.1).unwrap_or(&s.message)
+                            )))
+                            .child(
+                                Button::new(("stash-pop", i))
+                                    .ghost()
+                                    .compact()
+                                    .label("Pop")
+                                    .tooltip("Apply and remove this stash")
+                                    .disabled(busy.is_some())
+                                    .on_click(move |_, w, cx| {
+                                        let n = pop_name.clone();
+                                        pv.update(cx, |this, cx| {
+                                            this.git_op("stash pop", GitOp::StashPop(n), w, cx)
+                                        });
+                                    }),
+                            )
+                            .child(
+                                Button::new(("stash-drop", i))
+                                    .ghost()
+                                    .compact()
+                                    .icon(icon("trash"))
+                                    .tooltip("Delete this stash")
+                                    .disabled(busy.is_some())
+                                    .on_click(move |_, w, cx| {
+                                        let n = drop_name.clone();
+                                        dv.update(cx, |this, cx| {
+                                            this.git_op("stash drop", GitOp::StashDrop(n), w, cx)
+                                        });
+                                    }),
+                            )
                     })
+                    .collect();
+
+                div()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .child(top)
+                    .child(commit)
+                    .child(
+                        div()
+                            .id("git-scroll")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .child(head(
+                                format!("Staged Changes ({})", staged.len()),
+                                (!staged.is_empty()).then_some(unstage_all),
+                            ))
+                            .children(
+                                staged
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, (e, k))| row(i, e.path.clone(), *k, true)),
+                            )
+                            .child(head(
+                                format!("Changes ({})", changes_l.len()),
+                                (!changes_l.is_empty()).then_some(stage_all),
+                            ))
+                            .children(
+                                changes_l
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, (e, k))| row(10_000 + i, e.path.clone(), *k, false)),
+                            )
+                            .when(staged.is_empty() && changes_l.is_empty(), |d| {
+                                d.child(div().p_2().text_color(muted).child("Working tree clean"))
+                            })
+                            .child(head(
+                                format!("Stashes ({})", stash_rows.len()),
+                                (ov.staged + ov.unstaged + ov.untracked > 0).then_some(stash_all),
+                            ))
+                            .children(stash_rows),
+                    )
                     .into_any_element()
             }
         };
 
         let n_changes = self.git.as_ref().map(|s| s.entries.len()).unwrap_or(0);
-        let (fg, bg, panel_bg) = (theme.foreground, theme.background, theme.sidebar);
+        let (fg, bg) = (theme.foreground, theme.background);
         let right_line = if self.region == Region::Right {
             accent
         } else {
@@ -1410,7 +1898,6 @@ impl Render for Kalem {
                         fg,
                         muted,
                         bg,
-                        panel_bg,
                         cx.listener(|this, _, _, cx| {
                             this.right = Right::Explorer;
                             cx.notify();
@@ -1424,7 +1911,6 @@ impl Render for Kalem {
                         fg,
                         muted,
                         bg,
-                        panel_bg,
                         cx.listener(|this, _, _, cx| {
                             this.right = Right::Git;
                             cx.notify();
@@ -1614,7 +2100,6 @@ impl Render for Kalem {
                         fg,
                         muted,
                         bg,
-                        panel_bg,
                         cx.listener(|this, _, _, cx| {
                             this.bottom = Bottom::Output;
                             cx.notify();
@@ -1628,7 +2113,6 @@ impl Render for Kalem {
                         fg,
                         muted,
                         bg,
-                        panel_bg,
                         cx.listener(|this, _, _, cx| {
                             this.bottom = Bottom::Tests;
                             cx.notify();
