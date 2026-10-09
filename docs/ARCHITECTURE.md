@@ -6,8 +6,10 @@ Layered Cargo workspace. Nothing below the front ends depends on a UI toolkit or
 |---|---|---|
 | Core | `kalem-core` | Command registry, text buffer (rope + undo tree planned) |
 | Protocol clients | `kalem-lsp`, `kalem-dap` | LSP and DAP over stdio / TCP (planned) |
-| Language packs | `kalem-lang`, `languages/*.toml` | Declarative manifests wiring tools together |
-| Front ends | `apps/kalem` | CLI now; GUI and MCP server later |
+| Version control | `kalem-vcs` | `VcsBackend` trait (Git first) and hosting-platform detection; see [VERSION_CONTROL.md](VERSION_CONTROL.md) |
+| Test results | `kalem-test` | Test model, JUnit XML reader, overview summary; see [TESTING_AND_DEBUG_PANELS.md](TESTING_AND_DEBUG_PANELS.md) |
+| Language packs | `kalem-lang`, `src/kalem-lang/languages/*.toml` | Declarative manifests wiring tools together |
+| Front ends | `src/kalem` | CLI now; GUI and MCP server later |
 
 ## Rules
 

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/*", "apps/*"]
+members = ["src/kalem", "src/kalem-*", "tests"]
 
 [workspace.package]
 version = "0.0.1"

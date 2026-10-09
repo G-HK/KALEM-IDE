@@ -1,6 +1,0 @@
-[package]
-name = "kalem-lsp"
-description = "Kalem IDE Language Server Protocol client (planned)"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
