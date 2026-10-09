@@ -3548,6 +3548,9 @@ version = "0.0.1"
 [[package]]
 name = "kalem-dap"
 version = "0.0.1"
+dependencies = [
+ "serde_json",
+]
 
 [[package]]
 name = "kalem-lang"
@@ -3602,6 +3605,7 @@ version = "0.0.1"
 dependencies = [
  "gpui-kit",
  "kalem-core",
+ "kalem-dap",
  "kalem-test",
  "kalem-theme",
  "kalem-vcs",
@@ -3622,6 +3626,7 @@ dependencies = [
  "kalem-test",
  "kalem-vcs",
  "regex",
+ "serde_json",
 ]
 
 [[package]]

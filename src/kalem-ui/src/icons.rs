@@ -40,6 +40,7 @@ svgs!(
     "search",
     "bug",
     "square",
+    "pause",
     "circle-check",
     "arrow-down",
     "arrow-up",

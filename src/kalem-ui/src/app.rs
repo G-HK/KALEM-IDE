@@ -27,16 +27,25 @@ use kalem_workspace::kinds::{badge_for, is_image, project_index, project_kind, P
 use kalem_workspace::search::{
     matches_file_types, replace_in_files, search, SearchOptions, SearchResult,
 };
-use kalem_workspace::tasks::{spawn, Config, RunningTask, TaskEvent, TaskKind};
+use kalem_workspace::tasks::{spawn, Config, RunningTask, TaskEvent, TaskKind, TaskPlan};
 use kalem_workspace::{language_for, quick_open, Workspace};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 
+mod debugger;
+
 actions!(
     kalem,
     [
+        StartDebugging,
+        StopDebugging,
+        DebugPause,
+        StepOver,
+        StepInto,
+        StepOut,
+        ToggleBreakpoint,
         Save,
         OpenFolder,
         CloseTab,
@@ -225,7 +234,13 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-shift-f", ShowFind, None),
         KeyBinding::new("alt-left", NavBack, None),
         KeyBinding::new("alt-right", NavForward, None),
-        KeyBinding::new("f5", Refresh, None),
+        KeyBinding::new("secondary-shift-r", Refresh, None),
+        KeyBinding::new("f5", StartDebugging, None),
+        KeyBinding::new("shift-f5", StopDebugging, None),
+        KeyBinding::new("f9", ToggleBreakpoint, None),
+        KeyBinding::new("f10", StepOver, None),
+        KeyBinding::new("f11", StepInto, None),
+        KeyBinding::new("shift-f11", StepOut, None),
         KeyBinding::new("escape", CloseQuick, Some("QuickOpen")),
     ]);
     cx.on_action(|_: &Quit, cx| cx.quit());
@@ -239,6 +254,8 @@ pub(crate) struct OpenTab {
     pub _sub: Subscription,
     /// A diff view of `path` instead of the file's text (the editor is then unused).
     pub diff: Option<Rc<DiffDoc>>,
+    /// Breakpoint / current-line highlights, created when first needed.
+    pub marks: Option<debugger::Marks>,
 }
 
 /// Where a tab is moved to.
@@ -276,6 +293,7 @@ enum Bottom {
     Output,
     Tests,
     Find,
+    Debug,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -368,6 +386,15 @@ pub struct Kalem {
     windows: Vec<WinRef>,
     next_win: u64,
     tab_drag: Option<usize>,
+    // debugging
+    dbg: Option<debugger::DebugState>,
+    dbg_gen: u64,
+    /// Set between "build for debugging" and the build finishing.
+    pending_debug: Option<kalem_workspace::debug::DebugPlan>,
+    /// Breakpoints by workspace-relative path (1-based lines).
+    breakpoints: std::collections::BTreeMap<String, std::collections::BTreeSet<u32>>,
+    /// Where execution is stopped: (workspace-relative path, 1-based line).
+    pc: Option<(String, u32)>,
 }
 
 const MAX_OUTPUT: usize = 5000;
@@ -477,6 +504,11 @@ impl Kalem {
             windows: Vec::new(),
             next_win: 2,
             tab_drag: None,
+            dbg: None,
+            dbg_gen: 0,
+            pending_debug: None,
+            breakpoints: Default::default(),
+            pc: None,
             find_opts: SearchOptions::default(),
             find: None,
             find_busy: false,
@@ -783,6 +815,7 @@ impl Kalem {
             dirty: false,
             _sub: sub,
             diff: None,
+            marks: None,
         });
         self.message = None;
         self.activate(self.tabs.len() - 1, cx);
@@ -839,6 +872,7 @@ impl Kalem {
             dirty: false,
             _sub: sub,
             diff: Some(doc),
+            marks: None,
         });
         self.activate(self.tabs.len() - 1, cx);
     }
@@ -1467,7 +1501,16 @@ impl Kalem {
                     .push(format!("{} failed to start: {e}", kind.title()));
                 self.status_text = e;
             }
-            Ok(plan) => {
+            Ok(plan) => self.run_plan(plan, cx),
+        }
+        cx.notify();
+    }
+
+    /// Run a build/run/test command in the background and stream it to the Output panel.
+    fn run_plan(&mut self, plan: TaskPlan, cx: &mut Context<Self>) {
+        self.bottom = Bottom::Output;
+        {
+            {
                 if let Some(old) = self.task.take() {
                     old.task.cancel();
                 }
@@ -1510,10 +1553,12 @@ impl Kalem {
             return false;
         }
         let mut finished: Option<String> = None;
+        let mut succeeded = false;
         for _ in 0..800 {
             match state.task.rx.try_recv() {
                 Ok(TaskEvent::Line(l)) => self.output.push(l),
                 Ok(TaskEvent::Done(code)) => {
+                    succeeded = code == Some(0);
                     finished = Some(match code {
                         Some(0) => "succeeded".to_string(),
                         Some(c) => format!("failed (exit code {c})"),
@@ -1544,6 +1589,15 @@ impl Kalem {
             self.output.push(format!("--- {f} ---"));
             self.task = None;
             self.refresh(cx);
+            // A build started by "Start Debugging": launch the debugger when it worked.
+            if let Some(plan) = self.pending_debug.take() {
+                if succeeded {
+                    self.begin_session(plan, cx);
+                } else {
+                    self.dbg = None;
+                    self.status_text = "Debugging cancelled: the build did not succeed".into();
+                }
+            }
             return false;
         }
         self.output_scroll.scroll_to_bottom();
@@ -2120,6 +2174,8 @@ impl Render for Kalem {
         let (list_active, popover_bg) = (theme.list_active, theme.popover);
         let ws_open = self.ws.is_some();
         let running = self.task.is_some();
+        let debugging = self.dbg.is_some();
+        let paused = self.debug_paused_now();
 
         // ---------------------------------------------------------- menu bar
         let theme_names: Vec<String> = self.themes.iter().map(|t| t.name.clone()).collect();
@@ -2207,11 +2263,20 @@ impl Render for Kalem {
             }))
             .child(m("m-debug", "Debug").dropdown_menu(move |m, _, _| {
                 m.menu_with_enable("Start Without Debugging", Box::new(RunNoDebug), ws_open)
-                    .menu_with_disabled(
-                        "Start Debugging (not implemented yet)",
-                        Box::new(RunNoDebug),
-                        true,
+                    .separator()
+                    .menu_with_enable("Start / Continue (F5)", Box::new(StartDebugging), ws_open)
+                    .menu_with_enable(
+                        "Stop Debugging (Shift+F5)",
+                        Box::new(StopDebugging),
+                        debugging,
                     )
+                    .menu_with_enable("Pause", Box::new(DebugPause), debugging)
+                    .separator()
+                    .menu_with_enable("Step Over (F10)", Box::new(StepOver), debugging)
+                    .menu_with_enable("Step Into (F11)", Box::new(StepInto), debugging)
+                    .menu_with_enable("Step Out (Shift+F11)", Box::new(StepOut), debugging)
+                    .separator()
+                    .menu("Toggle Breakpoint (F9)", Box::new(ToggleBreakpoint))
             }))
             .child(m("m-test", "Test").dropdown_menu(move |m, _, _| {
                 m.menu_with_enable("Run All Tests", Box::new(RunTests), ws_open)
@@ -2360,10 +2425,67 @@ impl Render for Kalem {
                 Button::new("debug")
                     .ghost()
                     .compact()
-                    .icon(icon("bug"))
-                    .tooltip("Debugger: not implemented yet")
-                    .disabled(true),
+                    .icon(icon(if paused { "play" } else { "bug" }).text_color(c("accent")))
+                    .tooltip(if paused {
+                        "Continue (F5)"
+                    } else {
+                        "Start Debugging (F5)"
+                    })
+                    .disabled(!ws_open || (running && !debugging) || (debugging && !paused))
+                    .on_click(cx.listener(|this, _, _, cx| this.start_debugging(cx))),
             )
+            .when(debugging, |d| {
+                d.child(
+                    Button::new("dbg-pause")
+                        .ghost()
+                        .compact()
+                        .icon(icon("pause"))
+                        .tooltip("Pause")
+                        .disabled(paused)
+                        .on_click(cx.listener(|this, _, _, cx| this.debug_pause(cx))),
+                )
+                .child(
+                    Button::new("dbg-over")
+                        .ghost()
+                        .compact()
+                        .icon(icon("arrow-right"))
+                        .tooltip("Step Over (F10)")
+                        .disabled(!paused)
+                        .on_click(
+                            cx.listener(|this, _, _, cx| this.debug_step(debugger::Step::Over, cx)),
+                        ),
+                )
+                .child(
+                    Button::new("dbg-into")
+                        .ghost()
+                        .compact()
+                        .icon(icon("arrow-down"))
+                        .tooltip("Step Into (F11)")
+                        .disabled(!paused)
+                        .on_click(
+                            cx.listener(|this, _, _, cx| this.debug_step(debugger::Step::Into, cx)),
+                        ),
+                )
+                .child(
+                    Button::new("dbg-out")
+                        .ghost()
+                        .compact()
+                        .icon(icon("arrow-up"))
+                        .tooltip("Step Out (Shift+F11)")
+                        .disabled(!paused)
+                        .on_click(
+                            cx.listener(|this, _, _, cx| this.debug_step(debugger::Step::Out, cx)),
+                        ),
+                )
+                .child(
+                    Button::new("dbg-stop")
+                        .ghost()
+                        .compact()
+                        .icon(icon("square").text_color(c("danger")))
+                        .tooltip("Stop Debugging (Shift+F5)")
+                        .on_click(cx.listener(|this, _, _, cx| this.stop_debugging(cx))),
+                )
+            })
             .child(
                 Button::new("build")
                     .ghost()
@@ -2463,6 +2585,19 @@ impl Render for Kalem {
                 MouseButton::Left,
                 cx.listener(|this, _, window, cx| this.end_find_drag(window, cx)),
             )
+            .on_action(cx.listener(|this, _: &StartDebugging, _, cx| this.start_debugging(cx)))
+            .on_action(cx.listener(|this, _: &StopDebugging, _, cx| this.stop_debugging(cx)))
+            .on_action(cx.listener(|this, _: &DebugPause, _, cx| this.debug_pause(cx)))
+            .on_action(
+                cx.listener(|this, _: &StepOver, _, cx| this.debug_step(debugger::Step::Over, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &StepInto, _, cx| this.debug_step(debugger::Step::Into, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &StepOut, _, cx| this.debug_step(debugger::Step::Out, cx)),
+            )
+            .on_action(cx.listener(|this, _: &ToggleBreakpoint, _, cx| this.toggle_breakpoint(cx)))
             .on_action(cx.listener(|this, _: &Save, _, cx| this.save(cx)))
             .on_action(cx.listener(|this, a: &MoveTab, _, cx| this.move_tab(a.0, a.1, None, cx)))
             .on_action(cx.listener(|this, _: &OpenFolder, w, cx| this.pick_folder(w, cx)))
@@ -3286,6 +3421,7 @@ impl Render for Kalem {
             self.find_results(cx)
         };
 
+        let debug_panel = self.debug_panel(cx);
         let bottom = div()
             .size_full()
             .flex()
@@ -3303,6 +3439,7 @@ impl Render for Kalem {
                 Bottom::Output => output_panel,
                 Bottom::Tests => tests_panel,
                 Bottom::Find => find_panel,
+                Bottom::Debug => debug_panel,
             }))
             .child(
                 div()
@@ -3365,6 +3502,19 @@ impl Render for Kalem {
                         bg,
                         cx.listener(|this, _, _, cx| {
                             this.bottom = Bottom::Find;
+                            cx.notify();
+                        }),
+                    ))
+                    .child(panel_tab(
+                        "tab-debug",
+                        "Debug".into(),
+                        self.bottom == Bottom::Debug,
+                        bottom_line,
+                        fg,
+                        muted,
+                        bg,
+                        cx.listener(|this, _, _, cx| {
+                            this.bottom = Bottom::Debug;
                             cx.notify();
                         }),
                     )),

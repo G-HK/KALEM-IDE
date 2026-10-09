@@ -1,6 +1,7 @@
 //! Workspace model behind the IDE window: what is open, which files it has, its git state and its
 //! test results. No UI toolkit in here, so the CLI, the GUI and MCP can share it and CI can test it.
 
+pub mod debug;
 pub mod kinds;
 pub mod search;
 pub mod tasks;
