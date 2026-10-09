@@ -1,0 +1,13 @@
+[package]
+name = "kalem-workspace"
+description = "Kalem IDE workspace model: open a folder or solution, list files, git status, test results"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kalem-core = { path = "../kalem-core" }
+kalem-solution = { path = "../kalem-solution" }
+kalem-lang = { path = "../kalem-lang" }
+kalem-vcs = { path = "../kalem-vcs" }
+kalem-test = { path = "../kalem-test" }

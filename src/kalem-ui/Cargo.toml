@@ -1,0 +1,23 @@
+[package]
+name = "kalem-ui"
+description = "Kalem IDE desktop app (GPUI)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "kalem-ide"
+path = "src/main.rs"
+
+[dependencies]
+kalem-core = { path = "../kalem-core" }
+kalem-workspace = { path = "../kalem-workspace" }
+kalem-theme = { path = "../kalem-theme" }
+kalem-vcs = { path = "../kalem-vcs" }
+kalem-test = { path = "../kalem-test" }
+gpui-kit = { version = "0.7", features = [
+  "tree-sitter-rust", "tree-sitter-python", "tree-sitter-javascript", "tree-sitter-typescript",
+  "tree-sitter-tsx", "tree-sitter-go", "tree-sitter-java", "tree-sitter-kotlin", "tree-sitter-c",
+  "tree-sitter-cpp", "tree-sitter-csharp", "tree-sitter-toml", "tree-sitter-markdown",
+  "tree-sitter-yaml", "tree-sitter-bash", "tree-sitter-html", "tree-sitter-css",
+] }

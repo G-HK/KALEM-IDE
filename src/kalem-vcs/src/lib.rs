@@ -50,7 +50,7 @@ pub struct Capabilities {
     pub rebase: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChangeKind {
     Added,
     Modified,

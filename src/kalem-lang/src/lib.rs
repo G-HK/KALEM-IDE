@@ -109,6 +109,23 @@ impl LanguagePack {
     }
 }
 
+/// The packs that ship inside the binary, so an installed IDE needs no `languages/` folder.
+pub fn builtin() -> Vec<LanguagePack> {
+    [
+        include_str!("../languages/cpp.toml"),
+        include_str!("../languages/csharp.toml"),
+        include_str!("../languages/go.toml"),
+        include_str!("../languages/java.toml"),
+        include_str!("../languages/kotlin.toml"),
+        include_str!("../languages/python.toml"),
+        include_str!("../languages/rust.toml"),
+        include_str!("../languages/typescript.toml"),
+    ]
+    .iter()
+    .map(|t| LanguagePack::parse(t).expect("built-in language pack is valid"))
+    .collect()
+}
+
 /// Load every `*.toml` pack in `dir`, sorted by language id.
 pub fn load_dir(dir: &Path) -> Result<Vec<LanguagePack>, String> {
     let mut packs = Vec::new();
@@ -178,5 +195,15 @@ adapter = "java-debug"
             assert!(p.lsp.is_some(), "{} has no lsp", p.language.id);
             assert!(p.debug.is_some(), "{} has no debug adapter", p.language.id);
         }
+    }
+}
+
+#[cfg(test)]
+mod builtin_tests {
+    #[test]
+    fn built_in_packs_parse() {
+        let packs = super::builtin();
+        assert_eq!(packs.len(), 8);
+        assert!(packs.iter().any(|p| p.language.id == "rust"));
     }
 }

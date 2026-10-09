@@ -1,0 +1,9 @@
+[package]
+name = "kalem-theme"
+description = "Kalem IDE themes: palettes, user theme files, settings. No UI toolkit."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+toml.workspace = true

@@ -1,6 +1,12 @@
 [workspace]
 resolver = "2"
 members = ["src/kalem", "src/kalem-*", "tests"]
+# `cargo build/test/clippy` without -p skips the GUI crate: GPUI is heavy and needs system libraries.
+# Build it explicitly with `cargo build -p kalem-ui`.
+default-members = [
+  "src/kalem", "src/kalem-core", "src/kalem-dap", "src/kalem-lang", "src/kalem-lsp",
+  "src/kalem-solution", "src/kalem-test", "src/kalem-theme", "src/kalem-vcs", "src/kalem-workspace", "tests",
+]
 # Throw-away UI experiments with heavy dependencies: kept out of the main build and CI.
 exclude = ["spikes"]
 

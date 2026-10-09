@@ -1,0 +1,43 @@
+# Built-in theme "Kalem": the two basic palettes. Copy this file into your themes folder, change
+# `name` and any colours you like; anything you leave out falls back to "Kalem".
+# Colours are "#RRGGBB". Every theme has a [light] and a [dark] palette.
+name = "Kalem"
+
+# --- Light: the Black Panda palette.
+# PLACEHOLDER VALUES: replace with the official Black Panda brand colours.
+[light]
+background = "#ffffff"
+panel = "#f4f4f5"
+foreground = "#111111"
+muted_foreground = "#6b6b70"
+border = "#d8d8dc"
+list_active = "#e6e6ea"
+accent = "#111111"        # focus border, active tab line
+success = "#2e7d32"
+warning = "#b26a00"
+danger = "#c62828"
+folder = "#8a8a90"
+project = "#111111"
+solution = "#111111"
+lock = "#6b6b70"
+[light.badges]            # per file type; keys are the badge labels in lower case
+yml = "#c62828"
+
+# --- Dark: basic dark.
+[dark]
+background = "#1e1e1e"
+panel = "#252526"
+foreground = "#e6e6e6"
+muted_foreground = "#9aa0a6"
+border = "#3a3a3d"
+list_active = "#37373d"
+accent = "#9b87f5"
+success = "#68c868"
+warning = "#e5c07b"
+danger = "#f44747"
+folder = "#dcb67a"
+project = "#75beff"
+solution = "#a78bfa"
+lock = "#75beff"
+[dark.badges]
+yml = "#e0524d"
