@@ -6,7 +6,7 @@ Everything about getting Kalem IDE to users. Distribution is through **GitHub Re
 deployments/
 ├── env.sh                 shared: ROOT, VERSION (from Cargo.toml), DIST, warn(), sha256_file()
 ├── set_version.py         set the workspace version (release workflow)
-├── windows/               package.ps1, sign.ps1, kalem.wxs   -> .msi + portable .zip (x64, arm64)
+├── windows/               package.ps1, sign.ps1, kalem.nsi   -> setup .exe (NSIS) + portable .zip (x64, arm64)
 ├── macos/                 package.sh, import-cert.sh, entitlements.plist -> .pkg + .tar.gz (universal)
 └── linux/                 package.sh, nfpm.yaml              -> .deb + .rpm + .tar.gz (x86_64, aarch64)
 ```
@@ -15,9 +15,11 @@ Artifacts land in `dist/release/` (gitignored), each with a `.sha256`:
 
 | Platform | Files |
 |---|---|
-| Windows | `kalem-ide-<v>-windows-{x64,arm64}.msi`, `...-portable.zip` |
+| Windows | `kalem-ide-<v>-windows-{x64,arm64}-setup.exe`, `...-portable.zip` |
 | macOS | `kalem-ide-<v>-macos-universal.pkg`, `.tar.gz` |
 | Linux | `kalem-ide-<v>-linux-{x86_64,aarch64}.deb`, `.rpm`, `.tar.gz` |
+
+Windows setup: a wizard with an **Add Kalem to PATH** page (ticked by default; the uninstaller removes the entry). Silent: `setup.exe /S`, add `/NOPATH` to skip the PATH change.
 
 Installed layout: `<prefix>/bin/kalem` with the language packs in `<prefix>/share/kalem/languages` (Windows: `languages\` beside `kalem.exe`). Kalem finds them relative to the executable, or via `KALEM_LANGUAGES`.
 
@@ -26,7 +28,7 @@ Installed layout: `<prefix>/bin/kalem` with the language packs in `<prefix>/shar
 ```sh
 bash deployments/linux/package.sh          # Linux (deb/rpm need nfpm, else they are skipped)
 bash deployments/macos/package.sh          # macOS, ad-hoc signed
-pwsh deployments/windows/package.ps1       # Windows (needs WiX v5: dotnet tool install -g wix --version 5.0.2)
+pwsh deployments/windows/package.ps1       # Windows (needs NSIS: winget install NSIS.NSIS)
 ```
 
 ## Releasing

@@ -158,9 +158,11 @@ jobs:
       - name: Apply version
         shell: bash
         run: python deployments/set_version.py "$KALEM_VERSION"
-      - name: Install WiX
+      - name: Install NSIS
         shell: pwsh
-        run: dotnet tool install --global wix --version 5.0.2
+        run: |
+          choco install nsis -y --no-progress
+          "C:\Program Files (x86)\NSIS" | Out-File -Append -Encoding ascii $env:GITHUB_PATH
       - name: Build, sign, package
         shell: pwsh
         env:
@@ -181,6 +183,16 @@ jobs:
           Expand-Archive dist/release/*-portable.zip -DestinationPath $env:RUNNER_TEMP/portable
           & (Get-ChildItem $env:RUNNER_TEMP/portable -Recurse -Filter kalem.exe).FullName languages.list
           if ($LASTEXITCODE -ne 0) { throw 'portable kalem.exe failed' }
+          # Silent install, run from the install folder, check PATH, silent uninstall.
+          $setup = (Get-ChildItem dist/release -Filter *-setup.exe).FullName
+          Start-Process $setup -ArgumentList '/S' -Wait
+          $dir = "$env:ProgramFiles\Kalem IDE"
+          & "$dir\kalem.exe" languages.list
+          if ($LASTEXITCODE -ne 0) { throw 'installed kalem.exe failed' }
+          $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+          if (($machinePath -split ';') -notcontains $dir) { throw 'install folder is not on PATH' }
+          Start-Process "$dir\uninstall.exe" -ArgumentList '/S', "_?=$dir" -Wait
+          if (Test-Path "$dir\kalem.exe") { throw 'uninstall left kalem.exe behind' }
       - uses: actions/upload-artifact@v4
         with:
           name: release-windows-${{ matrix.arch }}

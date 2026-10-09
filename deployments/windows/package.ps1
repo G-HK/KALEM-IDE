@@ -4,15 +4,15 @@
 
 .DESCRIPTION
   Produces, in $env:DIST (default: dist/release):
-    kalem-ide-<version>-windows-<arch>.msi            per-machine installer (WiX v5), adds kalem to PATH
+    kalem-ide-<version>-windows-<arch>-setup.exe      installer (NSIS), optionally adds kalem to PATH
     kalem-ide-<version>-windows-<arch>-portable.zip   kalem.exe + languages\ (unzip and run)
     plus a .sha256 beside each
 
   The binary links the C runtime statically (+crt-static), so neither package needs the Visual
   C++ redistributable. Signing is delegated to sign.ps1 (skipped with a warning without secrets).
 
-  Needs: Rust (MSVC toolchain + the target), the Windows SDK (signtool.exe) and WiX v5:
-    dotnet tool install --global wix --version 5.0.2
+  Needs: Rust (MSVC toolchain + the target) and NSIS 3 (winget install NSIS.NSIS); signtool.exe only
+  when signing.
 
 .EXAMPLE
   pwsh deployments/windows/package.ps1 -Arch x64
@@ -41,8 +41,8 @@ if (-not $Version) {
   }
 }
 if (-not $Version) { throw 'could not read [workspace.package] version from Cargo.toml' }
-# MSI ProductVersion is numeric (major.minor.build); pre-release tags are dropped there.
-$MsiVersion = ($Version -split '-')[0]
+# Windows file version is numeric (major.minor.patch.0); pre-release tags are dropped there.
+$NumVersion = ($Version -split '-')[0]
 
 $Target = switch ($Arch) { 'x64' { 'x86_64-pc-windows-msvc' } 'arm64' { 'aarch64-pc-windows-msvc' } }
 $Dist = if ($env:DIST) { $env:DIST } else { Join-Path $Root 'dist\release' }
@@ -85,17 +85,27 @@ $Zip = Join-Path $Dist "$Name-portable.zip"
 Remove-Item -Force $Zip -ErrorAction SilentlyContinue
 Compress-Archive -Path $Stage -DestinationPath $Zip
 
-# ---- MSI ---------------------------------------------------------------------------------------
-$Msi = Join-Path $Dist "$Name.msi"
-Remove-Item -Force $Msi -ErrorAction SilentlyContinue
-$wixArch = if ($Arch -eq 'x64') { 'x64' } else { 'arm64' }
-Invoke-Native 'wix build' {
-  wix build (Join-Path $PSScriptRoot 'kalem.wxs') -arch $wixArch `
-    -d "Version=$MsiVersion" -d "BinDir=$Bin" -d "LangDir=$LangDir" -d "RootDir=$Root" -o $Msi
+# ---- installer (NSIS) --------------------------------------------------------------------------
+$makensis = (Get-Command makensis -ErrorAction SilentlyContinue).Source
+if (-not $makensis) {
+  foreach ($dir in @("${env:ProgramFiles(x86)}\NSIS", "$env:ProgramFiles\NSIS")) {
+    if (Test-Path "$dir\makensis.exe") { $makensis = "$dir\makensis.exe"; break }
+  }
 }
-& (Join-Path $PSScriptRoot 'sign.ps1') $Msi
+if (-not $makensis) {
+  Write-Warning "NSIS is not installed, so the setup .exe was NOT built. The portable zip is ready: $Zip"
+  Write-Warning "Install NSIS once:  winget install NSIS.NSIS   (or: choco install nsis), then run this script again"
+  exit 1
+}
+$Setup = Join-Path $Dist "$Name-setup.exe"
+Remove-Item -Force $Setup -ErrorAction SilentlyContinue
+Invoke-Native 'makensis' {
+  & $makensis /V2 "/DVERSION=$Version" "/DNUMVERSION=$NumVersion" "/DARCH=$Arch" "/DBINDIR=$Bin" `
+    "/DLANGDIR=$LangDir" "/DROOTDIR=$Root" "/DOUTFILE=$Setup" (Join-Path $PSScriptRoot 'kalem.nsi')
+}
+& (Join-Path $PSScriptRoot 'sign.ps1') $Setup
 
-foreach ($f in @($Zip, $Msi)) {
+foreach ($f in @($Zip, $Setup)) {
   $hash = (Get-FileHash $f -Algorithm SHA256).Hash.ToLower()
   "$hash  $(Split-Path $f -Leaf)" | Out-File "$f.sha256" -Encoding ascii
   Write-Output "created $f"

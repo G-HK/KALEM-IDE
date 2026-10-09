@@ -13,7 +13,7 @@
   Optional: WINDOWS_TIMESTAMP_URL, SIGNTOOL (path to signtool.exe).
 
 .EXAMPLE
-  pwsh deployments/windows/sign.ps1 dist/kalem.exe dist/kalem.msi
+  pwsh deployments/windows/sign.ps1 dist/kalem.exe dist/kalem-setup.exe
 #>
 param([Parameter(Mandatory = $true, ValueFromRemainingArguments = $true)] [string[]] $Files)
 $ErrorActionPreference = 'Stop'
