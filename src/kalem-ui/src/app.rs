@@ -1,4 +1,5 @@
 use crate::detached::{dest_at, mouse_up_probe, tab_strip, Detached, StripCtx, TabHost};
+use crate::diffview::{diff_view, DiffDoc};
 use crate::icons::icon;
 use crate::theming::{self, rgba};
 use gpui_kit::component::{
@@ -18,6 +19,7 @@ use gpui_kit::*;
 use kalem_core::explorer::Node;
 use kalem_test::{Outcome, TestRun};
 use kalem_theme::{Mode, Palette, Settings, Theme as KalemTheme};
+use kalem_vcs::diff::DiffRow;
 use kalem_vcs::git::{Branch, GitCli, Stash};
 use kalem_vcs::overview::ChangesOverview;
 use kalem_vcs::{ChangeKind, Status, VcsError};
@@ -235,6 +237,8 @@ pub(crate) struct OpenTab {
     pub saved: SharedString,
     pub dirty: bool,
     pub _sub: Subscription,
+    /// A diff view of `path` instead of the file's text (the editor is then unused).
+    pub diff: Option<Rc<DiffDoc>>,
 }
 
 /// Where a tab is moved to.
@@ -598,6 +602,7 @@ impl Kalem {
             }
             self.changes = Rc::new(map);
         }
+        self.reload_diffs();
         cx.notify();
     }
 
@@ -730,7 +735,11 @@ impl Kalem {
     // ----------------------------------------------------------------- tabs
 
     fn open_file(&mut self, rel: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(ix) = self.tabs.iter().position(|t| t.path == rel) {
+        if let Some(ix) = self
+            .tabs
+            .iter()
+            .position(|t| t.diff.is_none() && t.path == rel)
+        {
             self.activate(ix, cx);
             return;
         }
@@ -773,9 +782,76 @@ impl Kalem {
             saved,
             dirty: false,
             _sub: sub,
+            diff: None,
         });
         self.message = None;
         self.activate(self.tabs.len() - 1, cx);
+    }
+
+    /// Compute the diff of one file for a diff tab.
+    fn make_diff(&self, path: &str, staged: bool, untracked: bool) -> DiffDoc {
+        let res = match &self.ws {
+            Some(ws) => GitCli.file_diff(&ws.root, path, staged, untracked),
+            None => Err(VcsError::Failed("No folder open".into())),
+        };
+        let (diff, error) = match res {
+            Ok(d) => (d, None),
+            Err(e) => (Default::default(), Some(vcs_error_text(&e))),
+        };
+        let rows: Vec<DiffRow> = diff.rows();
+        DiffDoc {
+            path: path.to_string(),
+            staged,
+            untracked,
+            diff,
+            rows,
+            error,
+        }
+    }
+
+    /// Show what changed in a file (Git Changes panel click), side by side, in an editor tab.
+    fn open_diff(
+        &mut self,
+        path: &str,
+        staged: bool,
+        untracked: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let path = path.trim_end_matches('/');
+        let doc = Rc::new(self.make_diff(path, staged, untracked));
+        let existing = self.tabs.iter().position(|t| {
+            t.diff
+                .as_ref()
+                .is_some_and(|d| d.path == path && d.staged == staged)
+        });
+        if let Some(ix) = existing {
+            self.tabs[ix].diff = Some(doc);
+            self.activate(ix, cx);
+            return;
+        }
+        let editor = cx.new(|cx| EditorState::new(window, cx));
+        let sub = self.track_dirty(&editor, cx);
+        self.tabs.push(OpenTab {
+            path: path.to_string(),
+            editor,
+            saved: SharedString::default(),
+            dirty: false,
+            _sub: sub,
+            diff: Some(doc),
+        });
+        self.activate(self.tabs.len() - 1, cx);
+    }
+
+    /// After a stage/unstage/commit the open diff tabs show the new state.
+    fn reload_diffs(&mut self) {
+        for i in 0..self.tabs.len() {
+            let Some(d) = self.tabs[i].diff.clone() else {
+                continue;
+            };
+            let fresh = self.make_diff(&d.path, d.staged, d.untracked);
+            self.tabs[i].diff = Some(Rc::new(fresh));
+        }
     }
 
     /// Open a file and put the cursor on a 1-based line / 0-based column.
@@ -791,7 +867,7 @@ impl Kalem {
         let editor = self
             .tabs
             .iter()
-            .find(|t| t.path == rel)
+            .find(|t| t.diff.is_none() && t.path == rel)
             .map(|t| t.editor.clone());
         if let Some(editor) = editor {
             let pos = Position::new(line.saturating_sub(1) as u32, col as u32);
@@ -860,7 +936,12 @@ impl Kalem {
                 }
                 None => ws.files.clone(),
             },
-            2 => self.tabs.iter().map(|t| t.path.clone()).collect(),
+            2 => self
+                .tabs
+                .iter()
+                .filter(|t| t.diff.is_none())
+                .map(|t| t.path.clone())
+                .collect(),
             3 => self
                 .active
                 .and_then(|i| self.tabs.get(i))
@@ -989,9 +1070,12 @@ impl Kalem {
                         // Open, unmodified tabs show the new text.
                         for rel in &r.changed {
                             let text = this.ws.as_ref().and_then(|w| w.read_file(rel).ok());
-                            if let (Some(text), Some(tab)) =
-                                (text, this.tabs.iter_mut().find(|t| &t.path == rel))
-                            {
+                            if let (Some(text), Some(tab)) = (
+                                text,
+                                this.tabs
+                                    .iter_mut()
+                                    .find(|t| t.diff.is_none() && &t.path == rel),
+                            ) {
                                 tab.saved = text.clone().into();
                                 tab.dirty = false;
                                 tab.editor.update(cx, |e, cx| e.set_value(text, window, cx));
@@ -1034,7 +1118,7 @@ impl Kalem {
         self.region = Region::Editor;
         if !self.navigating {
             if let Some(t) = self.tabs.get(ix) {
-                if self.nav.get(self.nav_pos) != Some(&t.path) {
+                if t.diff.is_none() && self.nav.get(self.nav_pos) != Some(&t.path) {
                     self.nav
                         .truncate(self.nav_pos + usize::from(!self.nav.is_empty()));
                     self.nav.push(t.path.clone());
@@ -1293,7 +1377,7 @@ impl Kalem {
         let (Some(ws), Some(ix)) = (&self.ws, self.active) else {
             return;
         };
-        let Some(tab) = self.tabs.get_mut(ix) else {
+        let Some(tab) = self.tabs.get_mut(ix).filter(|t| t.diff.is_none()) else {
             return;
         };
         let text = tab.editor.read(cx).value();
@@ -2668,9 +2752,17 @@ impl Render for Kalem {
                                     name
                                 }))
                                 .child(div().truncate().text_xs().text_color(muted).child(dir))
-                                .on_click(move |_, window, cx| {
+                                .on_click(move |ev, window, cx| {
                                     let p = p_open.clone();
-                                    open.update(cx, |this, cx| this.open_file(&p, window, cx));
+                                    let untracked = k == ChangeKind::Untracked;
+                                    open.update(cx, |this, cx| {
+                                        // Click: what changed. Double click: the file itself.
+                                        if ev.click_count() >= 2 || p.ends_with('/') {
+                                            this.open_file(&p, window, cx)
+                                        } else {
+                                            this.open_diff(&p, staged, untracked, window, cx)
+                                        }
+                                    });
                                 }),
                         )
                         .child(
@@ -3074,6 +3166,13 @@ impl Render for Kalem {
                     .flex_1()
                     .min_h_0()
                     .child(match self.active.and_then(|i| self.tabs.get(i)) {
+                        Some(t) if t.diff.is_some() => diff_view(
+                            t.diff.as_ref().unwrap(),
+                            &self.palette,
+                            theme.foreground,
+                            muted,
+                            border,
+                        ),
                         Some(t) => Editor::new(&t.editor)
                             .appearance(false)
                             .h_full()

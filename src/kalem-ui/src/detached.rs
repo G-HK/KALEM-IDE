@@ -7,6 +7,7 @@
 //! it for those.
 
 use crate::app::{CloseTab, Dest, Kalem, MoveTab, OpenTab, Save};
+use crate::diffview::diff_view;
 use crate::theming::rgba;
 use gpui_kit::component::{
     input::{Editor, InputEvent},
@@ -50,7 +51,10 @@ pub(crate) fn tab_strip<T: TabHost>(
         .flex()
         .flex_wrap()
         .children(tabs.iter().enumerate().map(|(i, t)| {
-            let name = t.path.rsplit('/').next().unwrap_or(&t.path).to_string();
+            let name = match &t.diff {
+                Some(d) => d.title(),
+                None => t.path.rsplit('/').next().unwrap_or(&t.path).to_string(),
+            };
             let is_active = active == Some(i);
             // Each project gets its own colour on the tab's top edge, so you can tell at a
             // glance which project a document belongs to.
@@ -211,7 +215,11 @@ impl Detached {
 
     /// If this window has `path` open, show that tab and say so.
     pub fn show_path(&mut self, path: &str, cx: &mut Context<Self>) -> bool {
-        match self.tabs.iter().position(|t| t.path == path) {
+        match self
+            .tabs
+            .iter()
+            .position(|t| t.diff.is_none() && t.path == path)
+        {
             Some(ix) => {
                 self.active = Some(ix);
                 cx.notify();
@@ -332,6 +340,7 @@ impl Render for Detached {
             }
             None => (Palette::default(), Vec::new(), Vec::new(), None),
         };
+        let palette2 = palette.clone();
         let sc = StripCtx {
             accent: rgba(palette.get("accent")),
             palette,
@@ -370,6 +379,13 @@ impl Render for Detached {
             .child(tab_strip(&self.tabs, self.active, &sc, cx))
             .child(
                 div().flex_1().min_h_0().child(match active {
+                    Some(t) if t.diff.is_some() => diff_view(
+                        t.diff.as_ref().unwrap(),
+                        &palette2,
+                        theme.foreground,
+                        sc.muted,
+                        sc.border,
+                    ),
                     Some(t) => Editor::new(&t.editor)
                         .appearance(false)
                         .h_full()

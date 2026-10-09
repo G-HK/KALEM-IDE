@@ -267,10 +267,9 @@ mod tests {
     use std::fs;
 
     fn temp() -> std::path::PathBuf {
-        let n = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        // A counter, not the clock: macOS clocks tick in microseconds and tests start together.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let d = std::env::temp_dir().join(format!("kalem-search-{}-{n}", std::process::id()));
         fs::create_dir_all(&d).unwrap();
         d

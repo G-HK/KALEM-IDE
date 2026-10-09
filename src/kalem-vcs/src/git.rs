@@ -63,6 +63,36 @@ impl GitCli {
         self.run_text(repo, &refs)
     }
 
+    /// The change to one file: staged (index vs HEAD), unstaged (working tree vs index) or, for
+    /// a file git does not track yet, the whole file as an addition.
+    pub fn file_diff(
+        &self,
+        repo: &Path,
+        path: &str,
+        staged: bool,
+        untracked: bool,
+    ) -> Result<crate::diff::FileDiff, VcsError> {
+        if untracked && !staged {
+            let bytes = std::fs::read(repo.join(path.trim_end_matches('/')))
+                .map_err(|e| VcsError::Failed(format!("{path}: {e}")))?;
+            if bytes.contains(&0) {
+                return Ok(crate::diff::FileDiff {
+                    binary: true,
+                    ..Default::default()
+                });
+            }
+            return Ok(crate::diff::all_added(&String::from_utf8_lossy(&bytes)));
+        }
+        let mut args = vec!["diff", "--no-color", "--no-ext-diff", "-U3"];
+        if staged {
+            args.push("--cached");
+        }
+        args.push("--");
+        args.push(path);
+        let out = self.run_text(repo, &args)?;
+        Ok(crate::diff::parse_unified(&out))
+    }
+
     /// Stage paths (new, modified and deleted files alike).
     pub fn stage(&self, repo: &Path, paths: &[String]) -> Result<(), VcsError> {
         if paths.is_empty() {
@@ -382,10 +412,9 @@ mod tests {
     }
 
     fn temp_repo() -> PathBuf {
-        let n = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        // A counter, not the clock: macOS clocks tick in microseconds and tests start together.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!("kalem-vcs-test-{}-{n}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -497,6 +526,37 @@ mod tests {
         let s = GitCli.status(&dir).unwrap();
         assert_eq!(s.entries[0].staged, None);
         assert_eq!(s.entries[0].unstaged, Some(ChangeKind::Modified));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn file_diffs_staged_unstaged_untracked() {
+        let dir = repo_with_identity();
+        fs::write(dir.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        GitCli.stage_all(&dir).unwrap();
+        GitCli.commit(&dir, "init", false).unwrap();
+
+        fs::write(dir.join("a.txt"), "one\nTWO\nthree\n").unwrap();
+        let d = GitCli.file_diff(&dir, "a.txt", false, false).unwrap();
+        assert_eq!((d.added, d.removed), (1, 1));
+        assert!(GitCli
+            .file_diff(&dir, "a.txt", true, false)
+            .unwrap()
+            .hunks
+            .is_empty());
+
+        GitCli.stage(&dir, &["a.txt".into()]).unwrap();
+        assert!(GitCli
+            .file_diff(&dir, "a.txt", false, false)
+            .unwrap()
+            .hunks
+            .is_empty());
+        let d = GitCli.file_diff(&dir, "a.txt", true, false).unwrap();
+        assert_eq!((d.added, d.removed), (1, 1));
+
+        fs::write(dir.join("new.txt"), "x\ny\n").unwrap();
+        let d = GitCli.file_diff(&dir, "new.txt", false, true).unwrap();
+        assert_eq!((d.added, d.removed), (2, 0));
         fs::remove_dir_all(&dir).ok();
     }
 

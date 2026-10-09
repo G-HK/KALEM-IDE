@@ -10,6 +10,7 @@
 //! Write operations go through the real `git` executable so the user's config,
 //! credential helpers, hooks, LFS and signing behave exactly as in a terminal.
 
+pub mod diff;
 pub mod forge;
 pub mod git;
 pub mod overview;

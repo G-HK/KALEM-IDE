@@ -2,6 +2,7 @@
 
 mod app;
 mod detached;
+mod diffview;
 mod icons;
 mod theming;
 
