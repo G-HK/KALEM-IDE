@@ -1,13 +1,15 @@
 name: Release
 
-# Manual only: Actions tab -> Release -> Run workflow, then enter a version like v0.1.0.
-# Builds binaries for every OS (packaging scripts live in deployments/scripts) and attaches
-# them, with SHA256 checksums, to a GitHub Release (the tag is created if it does not exist).
+# Manual only: Actions tab -> Release -> Run workflow, then enter a version like 0.1.0.
+# Builds installers for every OS with the scripts in deployments/ and creates a DRAFT GitHub
+# Release to review and publish. Signing secrets are optional: without them the artifacts are
+# unsigned (a warning, never a failed build). Signing jobs run in the `release` environment,
+# which holds the secrets.
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Release version/tag, e.g. v0.1.0"
+        description: "Release version, e.g. 0.1.0 or 0.1.0-rc.1"
         required: true
         type: string
       prerelease:
@@ -17,48 +19,179 @@ on:
         type: boolean
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release
+  # Never cancel a run mid-notarization or mid-upload.
+  cancel-in-progress: false
 
 env:
-  VERSION: ${{ inputs.version }}
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  INPUT_VERSION: ${{ inputs.version }}
 
 jobs:
-  build:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - id: v
+        name: Validate version
+        run: |
+          v="${INPUT_VERSION#v}"
+          if ! printf '%s' "$v" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'; then
+            echo "::error::'$v' is not a version like 1.2.3 or 1.2.3-rc.1"
+            exit 1
+          fi
+          echo "version=$v" >>"$GITHUB_OUTPUT"
+
+  linux:
+    name: Linux ${{ matrix.arch }}
+    needs: version
+    # The oldest GitHub-hosted image, so binaries only need glibc >= 2.35 (Ubuntu 22.04+,
+    # Debian 12+, Fedora 36+). This job signs nothing, so it gets no environment and no secrets.
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu,  name: linux-x86_64,   unix: true }
-          - { os: macos-latest,   target: x86_64-apple-darwin,       name: macos-x86_64,   unix: true }
-          - { os: macos-latest,   target: aarch64-apple-darwin,      name: macos-aarch64,  unix: true }
-          - { os: windows-latest, target: x86_64-pc-windows-msvc,    name: windows-x86_64, unix: false }
-    runs-on: ${{ matrix.os }}
+          - { arch: x86_64, runner: ubuntu-22.04 }
+          - { arch: aarch64, runner: ubuntu-22.04-arm }
+    env:
+      KALEM_VERSION: ${{ needs.version.outputs.version }}
+      NFPM_VERSION: 2.47.0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-linux-${{ matrix.arch }}
+      - name: Install nfpm
+        run: |
+          arch=$([ "${{ matrix.arch }}" = x86_64 ] && echo amd64 || echo arm64)
+          curl -fsSL -o "$RUNNER_TEMP/nfpm.deb" \
+            "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_${arch}.deb"
+          sudo dpkg -i "$RUNNER_TEMP/nfpm.deb"
+      - name: Apply version
+        run: python3 deployments/set_version.py "$KALEM_VERSION"
+      - name: Build and package (deb, rpm, tar.gz)
+        run: bash deployments/linux/package.sh
+      - name: Check the packages
+        run: |
+          dpkg-deb --info dist/release/*.deb
+          dpkg-deb --contents dist/release/*.deb | grep -E 'usr/bin/kalem$|share/kalem/languages/rust.toml'
+          ldd target/release/kalem
+          dpkg-deb -x dist/release/*.deb "$RUNNER_TEMP/inst"
+          "$RUNNER_TEMP/inst/usr/bin/kalem" languages.list
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-${{ matrix.arch }}
+          path: dist/release/*
+          if-no-files-found: error
+
+  macos:
+    name: macOS universal
+    needs: version
+    runs-on: macos-latest
+    environment: release
+    env:
+      KALEM_VERSION: ${{ needs.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
-      - name: Build
-        run: cargo build --release -p kalem --target ${{ matrix.target }}
-      - name: Package (unix)
-        if: matrix.unix
-        shell: bash
-        run: bash deployments/scripts/package-unix.sh "$VERSION" "${{ matrix.target }}" "${{ matrix.name }}"
-      - name: Package (windows)
-        if: ${{ !matrix.unix }}
-        shell: pwsh
-        run: ./deployments/scripts/package-windows.ps1 -Version $env:VERSION -Target "${{ matrix.target }}" -Name "${{ matrix.name }}"
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-macos-universal
+      - name: Apply version
+        run: python3 deployments/set_version.py "$KALEM_VERSION"
+      - name: Import signing certificate
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: bash deployments/macos/import-cert.sh
+      - name: Build, sign, notarize
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: bash deployments/macos/package.sh --arch universal
+      - name: Check the installer
+        run: |
+          lipo -info target/aarch64-apple-darwin/release/kalem
+          pkgutil --payload-files dist/release/*.pkg | grep -E 'usr/local/bin/kalem$|languages/rust.toml'
+          tar -xzf dist/release/*.tar.gz -C "$RUNNER_TEMP"
+          "$RUNNER_TEMP"/kalem-ide-*-macos-universal/bin/kalem app.version
       - uses: actions/upload-artifact@v4
         with:
-          name: kalem-ide-${{ matrix.name }}
-          path: |
-            kalem-ide-*.tar.gz
-            kalem-ide-*.zip
-            kalem-ide-*.sha256
+          name: release-macos
+          path: dist/release/*
+          if-no-files-found: error
+      - name: Remove temporary keychain
+        if: always()
+        run: |
+          if [ -n "${MACOS_KEYCHAIN:-}" ]; then security delete-keychain "$MACOS_KEYCHAIN" || true; fi
+
+  windows:
+    name: Windows ${{ matrix.arch }}
+    needs: version
+    runs-on: windows-latest
+    environment: release
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, arm64]   # arm64 is cross-compiled on the x64 runner
+    env:
+      KALEM_VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.arch == 'x64' && 'x86_64-pc-windows-msvc' || 'aarch64-pc-windows-msvc' }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-windows-${{ matrix.arch }}
+      - name: Apply version
+        shell: bash
+        run: python deployments/set_version.py "$KALEM_VERSION"
+      - name: Install WiX
+        shell: pwsh
+        run: dotnet tool install --global wix --version 5.0.2
+      - name: Build, sign, package
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_SIGNING_ENDPOINT: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          AZURE_SIGNING_ACCOUNT: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          AZURE_CERT_PROFILE: ${{ secrets.AZURE_CERT_PROFILE }}
+          AZURE_CODESIGN_DLIB: ${{ secrets.AZURE_CODESIGN_DLIB }}
+        run: ./deployments/windows/package.ps1 -Arch ${{ matrix.arch }}
+      - name: Smoke test (x64 only)
+        if: matrix.arch == 'x64'
+        shell: pwsh
+        run: |
+          Expand-Archive dist/release/*-portable.zip -DestinationPath $env:RUNNER_TEMP/portable
+          & (Get-ChildItem $env:RUNNER_TEMP/portable -Recurse -Filter kalem.exe).FullName languages.list
+          if ($LASTEXITCODE -ne 0) { throw 'portable kalem.exe failed' }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-windows-${{ matrix.arch }}
+          path: dist/release/*
+          if-no-files-found: error
 
   publish:
-    needs: build
+    needs: [version, linux, macos, windows]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -66,7 +199,9 @@ jobs:
           merge-multiple: true
       - uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.version }}
+          tag_name: v${{ needs.version.outputs.version }}
+          name: Kalem IDE v${{ needs.version.outputs.version }}
+          draft: true
           prerelease: ${{ inputs.prerelease }}
           files: dist/*
           generate_release_notes: true

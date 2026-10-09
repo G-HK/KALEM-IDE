@@ -6,7 +6,8 @@ use std::path::PathBuf;
 
 /// Locate the bundled language packs.
 ///
-/// Order: `KALEM_LANGUAGES`, `<exe dir>/languages`, `./languages`,
+/// Order: `KALEM_LANGUAGES`, `<exe dir>/languages`, `<exe dir>/../share/kalem/languages`,
+/// `./languages`,
 /// `./src/kalem-lang/languages` (running from a source checkout).
 pub fn default_languages_dir() -> PathBuf {
     if let Some(p) = std::env::var_os("KALEM_LANGUAGES") {
@@ -16,6 +17,8 @@ pub fn default_languages_dir() -> PathBuf {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             candidates.push(dir.join("languages"));
+            // Installed layout: <prefix>/bin/kalem and <prefix>/share/kalem/languages.
+            candidates.push(dir.join("../share/kalem/languages"));
         }
     }
     candidates.push(PathBuf::from("languages"));

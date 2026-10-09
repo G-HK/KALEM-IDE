@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Kalem IDE MSI (WiX Toolset v5: `dotnet tool install -g wix --version 5.0.2`). Built by package.ps1:
+
+    wix build kalem.wxs -arch x64 -d Version=1.2.3 -d BinDir=... -d LangDir=... -o out.msi
+
+  Per-machine install into Program Files, `languages\` beside the exe, and the install folder
+  added to the system PATH so `kalem` works in any terminal. Start Menu shortcut comes with
+  the GUI.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+      Name="Kalem IDE"
+      Manufacturer="Kalem IDE contributors"
+      Version="$(var.Version)"
+      UpgradeCode="e2580db4-5d72-4542-a619-c174e313a1ef"
+      Scope="perMachine"
+      Compressed="yes"
+      Language="1033">
+    <SummaryInformation Description="Kalem IDE" Manufacturer="Kalem IDE contributors" />
+    <!-- Same-version upgrades let successive pre-releases of one X.Y.Z replace each other
+         (MSI versions are numeric, so 1.2.3-rc.1 and 1.2.3-rc.2 are both 1.2.3). -->
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+        DowngradeErrorMessage="A newer version of Kalem IDE is already installed." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/OWNER/kalem-ide" />
+
+    <StandardDirectory Id="ProgramFiles6432Folder">
+      <Directory Id="INSTALLFOLDER" Name="Kalem IDE">
+        <Directory Id="LANGUAGESFOLDER" Name="languages" />
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="Main" Title="Kalem IDE" Level="1">
+      <ComponentGroupRef Id="KalemFiles" />
+      <ComponentGroupRef Id="KalemLanguages" />
+    </Feature>
+  </Package>
+
+  <Fragment>
+    <ComponentGroup Id="KalemFiles" Directory="INSTALLFOLDER">
+      <Component Id="KalemExe" Guid="6c0b3d3a-5f3c-4c0e-9a55-3d3b2c1f7a01">
+        <File Id="KalemExeFile" Source="$(var.BinDir)\kalem.exe" KeyPath="yes" />
+        <RegistryValue Root="HKLM" Key="Software\Microsoft\Windows\CurrentVersion\App Paths\kalem.exe"
+            Value="[#KalemExeFile]" Type="string" />
+      </Component>
+      <Component Id="KalemPath" Guid="6c0b3d3a-5f3c-4c0e-9a55-3d3b2c1f7a02">
+        <CreateFolder />
+        <Environment Id="KalemOnPath" Name="PATH" Value="[INSTALLFOLDER]" Part="last"
+            Action="set" System="yes" Permanent="no" />
+      </Component>
+      <Component Id="KalemLicenses" Guid="6c0b3d3a-5f3c-4c0e-9a55-3d3b2c1f7a03">
+        <File Id="LicenseMit" Source="$(var.RootDir)\LICENSE-MIT" />
+        <File Id="LicenseApache" Source="$(var.RootDir)\LICENSE-APACHE" />
+        <File Id="ReadmeMd" Source="$(var.RootDir)\README.md" />
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+
+  <Fragment>
+    <ComponentGroup Id="KalemLanguages" Directory="LANGUAGESFOLDER">
+      <Files Include="$(var.LangDir)\*.toml" />
+    </ComponentGroup>
+  </Fragment>
+</Wix>

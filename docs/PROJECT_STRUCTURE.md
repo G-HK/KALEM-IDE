@@ -13,7 +13,7 @@ kalem-ide/
 │   └── kalem-dap/           DAP client (stub)
 ├── tests/                   integration / end-to-end tests and fixtures
 ├── docs/                    design docs (this folder)
-├── deployments/             packaging scripts and release notes
+├── deployments/            packaging for Windows (MSI), macOS (pkg), Linux (deb/rpm/tar.gz); see its README
 ├── .github/workflows/       CI and Release (manual triggers)
 └── root files               Cargo.toml, README, licenses, rustfmt, .gitignore, .gitattributes, .editorconfig
 ```

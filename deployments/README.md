@@ -2,15 +2,48 @@
 
 Everything about getting Kalem IDE to users. Distribution is through **GitHub Releases** only (not crates.io).
 
-- `scripts/package-unix.sh` – tar.gz + SHA256 for Linux and macOS
-- `scripts/package-windows.ps1` – zip + SHA256 for Windows
-- `.github/workflows/release.yml` – manual workflow that builds all targets and calls the scripts
-
-Try locally (Linux):
-
-```sh
-cargo build --release -p kalem --target x86_64-unknown-linux-gnu
-bash deployments/scripts/package-unix.sh v0.0.0-local x86_64-unknown-linux-gnu linux-x86_64
+```
+deployments/
+├── env.sh                 shared: ROOT, VERSION (from Cargo.toml), DIST, warn(), sha256_file()
+├── set_version.py         set the workspace version (release workflow)
+├── windows/               package.ps1, sign.ps1, kalem.wxs   -> .msi + portable .zip (x64, arm64)
+├── macos/                 package.sh, import-cert.sh, entitlements.plist -> .pkg + .tar.gz (universal)
+└── linux/                 package.sh, nfpm.yaml              -> .deb + .rpm + .tar.gz (x86_64, aarch64)
 ```
 
-Not done yet: code signing (Windows SmartScreen, macOS notarization), installers (MSI/dmg/deb), auto-update.
+Artifacts land in `dist/release/` (gitignored), each with a `.sha256`:
+
+| Platform | Files |
+|---|---|
+| Windows | `kalem-ide-<v>-windows-{x64,arm64}.msi`, `...-portable.zip` |
+| macOS | `kalem-ide-<v>-macos-universal.pkg`, `.tar.gz` |
+| Linux | `kalem-ide-<v>-linux-{x86_64,aarch64}.deb`, `.rpm`, `.tar.gz` |
+
+Installed layout: `<prefix>/bin/kalem` with the language packs in `<prefix>/share/kalem/languages` (Windows: `languages\` beside `kalem.exe`). Kalem finds them relative to the executable, or via `KALEM_LANGUAGES`.
+
+## Run locally
+
+```sh
+bash deployments/linux/package.sh          # Linux (deb/rpm need nfpm, else they are skipped)
+bash deployments/macos/package.sh          # macOS, ad-hoc signed
+pwsh deployments/windows/package.ps1       # Windows (needs WiX v5: dotnet tool install -g wix --version 5.0.2)
+```
+
+## Releasing
+
+Actions tab -> Release -> Run workflow, enter a version like `0.1.0`. Test builds work with no secrets: they are just unsigned. The result is a **draft** GitHub Release to review and publish.
+
+Signing secrets (repository environment `release`, all optional):
+
+| Secret | Used for |
+|---|---|
+| `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `KEYCHAIN_PASSWORD` | .p12 with Developer ID Application (+ Installer) |
+| `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID` | notarization (app-specific password) |
+| `WINDOWS_CERTIFICATE`, `WINDOWS_CERTIFICATE_PASSWORD` | base64 .pfx Authenticode certificate |
+| `AZURE_*` | alternative: Azure Trusted Signing |
+
+Without signing, Windows shows SmartScreen and macOS shows a Gatekeeper warning on first run.
+
+## Not done yet
+
+AppImage and Flatpak, a macOS `.app`/`.dmg` and Windows Start Menu shortcut (these come with the GUI), icons, Winget/Homebrew/Scoop manifests, auto-update.

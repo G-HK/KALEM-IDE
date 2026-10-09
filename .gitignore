@@ -110,3 +110,6 @@ scratch/
 
 # Kalem IDE per-user state (open tabs, breakpoints, layout). The *.kalem solution file IS committed.
 .kalem/
+
+# Packaging output
+dist/

@@ -1,0 +1,45 @@
+# .deb and .rpm packages (nfpm: https://nfpm.goreleaser.com). Run by package.sh, which stages the
+# file tree, substitutes its path for ${STAGE} (nfpm does not expand env vars in `src`) and
+# exports VERSION and NFPM_ARCH.
+#
+#   nfpm package -f deployments/linux/nfpm.yaml -p deb -t dist/release/
+name: kalem-ide
+arch: ${NFPM_ARCH}
+platform: linux
+version: ${VERSION}
+# semver: 0.2.0-rc.1 becomes 0.2.0~rc.1 in deb/rpm, so pre-releases sort before the release.
+version_schema: semver
+release: 1
+section: devel
+priority: optional
+maintainer: Kalem IDE maintainers <noreply@users.noreply.github.com>
+homepage: https://github.com/OWNER/kalem-ide
+license: MIT OR Apache-2.0
+description: |-
+  Kalem IDE: an open-source, multi-language, cross-platform IDE written in Rust.
+  Language packs for C/C++, Rust, C#, Python, TypeScript, Go, Java and Kotlin;
+  Git and hosting platforms; test and debug overviews.
+
+# The binary links only glibc and libgcc_s directly.
+overrides:
+  deb:
+    depends:
+      - libc6 (>= 2.35)
+      - libgcc-s1
+    recommends:
+      - git
+  rpm:
+    depends:
+      # Same floor as the deb: built on glibc 2.35, so older systems must refuse the install
+      # instead of installing a binary that cannot start.
+      - glibc >= 2.35
+    recommends:
+      - git
+
+contents:
+  - src: ${STAGE}/usr/bin/kalem
+    dst: /usr/bin/kalem
+    file_info: { mode: 0755 }
+  - src: ${STAGE}/usr/share/
+    dst: /usr/share/
+    type: tree
