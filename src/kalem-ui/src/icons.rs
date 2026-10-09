@@ -58,6 +58,9 @@ svgs!(
     "arrow-up-to-line",
     "arrow-up-down",
     "git-graph",
+    "label-explorer",
+    "label-git",
+    "label-find",
 );
 
 pub fn icon(name: &str) -> Icon {

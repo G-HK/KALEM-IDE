@@ -21,10 +21,24 @@ bottom panel with **Git Changes** and **Test Results**, plus a status bar. Panel
 
 Run and build instructions: [RUNNING.md](RUNNING.md). Since milestone 1 the app also has Find / Replace in Files, a Git panel with diffs, tab tear-off, a debugger and language-server features; see the [roadmap](ROADMAP.md) for the current state and what is missing.
 
-## Side panel title bar and auto-hide
+## Side panels: dock, auto-hide, edge strip
 
-The right dock has a title bar like Visual Studio's: the panel name, a window-position menu
-(Dock, Auto Hide, Close), a pin button and a close button. Unpinning (or Auto Hide) collapses the
-dock to a strip of icons on the right edge; clicking an icon slides the panel over the editor, and
-clicking in the editor slides it away again. Pin it to dock it back. After Close, View >
-Solution Explorer / Git Changes brings it back. The pin state is not saved between runs yet.
+Each right-dock panel (Solution Explorer, Git Changes, Find) has a title bar with a
+window-position menu (Dock / Auto Hide), a pin button and a close button, like Visual Studio.
+
+- **Docked** panels share the dock; their tabs are at the bottom.
+- **Auto-hidden** panels (pin button, or the X) collapse to a strip on the right edge, shown as
+  vertical tabs. Click a tab to slide the panel over the editor; click in the editor to hide it
+  again; pin it to dock it back. The X never loses a panel: it stays on the strip.
+- View > Solution Explorer / Git Changes always brings a panel back.
+
+The pin state is not saved between runs yet.
+
+## Diff view
+
+Clicking a file in **Git Changes** opens a diff tab (side by side or unified).
+
+- Changed blocks are tinted across both panes and the gutter: blue = changed, green = added, grey = removed. A ribbon joins the lines of one side to the lines of the other (5 lines become 1, 0 become 3, ...), and the changed words inside a modified line are picked out.
+- **Working Tree** diffs are editable: the left pane is the index version (read-only), the right pane ("Current version") is the real file. Edit it and the differences, highlights and ribbons are recomputed on every keystroke; **Ctrl+S** saves the file. The left pane follows the right one when you scroll. If the same file is open in a normal tab, both tabs share one editor.
+- **Staged** diffs and diffs in a torn-off window are read-only.
+- Previous / next difference buttons jump between blocks.

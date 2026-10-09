@@ -160,6 +160,15 @@ impl GitCli {
         )
     }
 
+    /// The staged (index) version of a file, `None` when git does not know the file yet.
+    pub fn index_text(&self, repo: &Path, path: &str) -> Result<Option<String>, VcsError> {
+        match self.run(repo, &["show", &format!(":{path}")]) {
+            Ok(bytes) => Ok(Some(String::from_utf8_lossy(&bytes).into_owned())),
+            Err(VcsError::NotInstalled(e)) => Err(VcsError::NotInstalled(e)),
+            Err(_) => Ok(None),
+        }
+    }
+
     pub fn fetch(&self, repo: &Path) -> Result<String, VcsError> {
         self.run_text(repo, &["fetch", "--all", "--prune"])
     }

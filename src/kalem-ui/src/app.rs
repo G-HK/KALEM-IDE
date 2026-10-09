@@ -1,5 +1,5 @@
 use crate::detached::{dest_at, mouse_up_probe, tab_strip, Detached, StripCtx, TabHost};
-use crate::diffview::{diff_view, DiffDoc};
+use crate::diffview::{diff_view, DiffDoc, Live};
 use crate::icons::icon;
 use crate::theming::{self, rgba};
 use gpui_kit::component::{
@@ -12,7 +12,7 @@ use gpui_kit::component::{
     menu::DropdownMenu as _,
     resizable::{h_resizable, resizable_panel, v_resizable},
     tree::{tree, TreeItem, TreeState},
-    ActiveTheme as _, Disableable as _, Selectable as _,
+    ActiveTheme as _, Disableable as _,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -68,9 +68,6 @@ actions!(
         GitSync,
         GitLog,
         GitStashAll,
-        DockRight,
-        AutoHideRight,
-        CloseRight,
         ShowOutput,
         ShowTests,
         ShowFind,
@@ -105,6 +102,16 @@ pub struct SetStartup(pub usize);
 #[derive(Clone, PartialEq, Action)]
 #[action(namespace = kalem, no_json)]
 pub struct CheckoutBranch(pub String);
+
+/// Pin a right-dock panel (index into [`Right::ALL`]) back into the dock.
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = kalem, no_json)]
+pub struct DockRight(pub usize);
+
+/// Collapse a right-dock panel (index into [`Right::ALL`]) to the edge strip.
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = kalem, no_json)]
+pub struct AutoHideRight(pub usize);
 
 #[derive(Clone, PartialEq, Action)]
 #[action(namespace = kalem, no_json)]
@@ -287,6 +294,13 @@ pub(crate) struct OpenTab {
     pub marks: Option<debugger::Marks>,
 }
 
+impl OpenTab {
+    /// The tab edits the file itself (a plain file tab, or an editable diff).
+    fn edits_file(&self) -> bool {
+        self.diff.as_ref().is_none_or(|d| d.live.is_some())
+    }
+}
+
 /// Where a tab is moved to.
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum Dest {
@@ -315,6 +329,44 @@ enum Right {
     Explorer,
     Git,
     Find,
+}
+
+impl Right {
+    const ALL: [Right; 3] = [Right::Explorer, Right::Git, Right::Find];
+
+    fn title(self) -> &'static str {
+        match self {
+            Right::Explorer => "Solution Explorer",
+            Right::Git => "Git Changes",
+            Right::Find => "Find and Replace",
+        }
+    }
+
+    fn from_ix(i: usize) -> Right {
+        Right::ALL[i.min(2)]
+    }
+
+    fn ix(self) -> usize {
+        Right::ALL.iter().position(|r| *r == self).unwrap_or(0)
+    }
+
+    /// Size in px of the rotated label svg.
+    fn label_size(self) -> (f32, f32) {
+        match self {
+            Right::Explorer => (17., 105.),
+            Right::Git => (17., 78.),
+            Right::Find => (17., 106.),
+        }
+    }
+
+    /// The rotated label shown on the edge strip.
+    fn label_icon(self) -> &'static str {
+        match self {
+            Right::Explorer => "label-explorer",
+            Right::Git => "label-git",
+            Right::Find => "label-find",
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -350,12 +402,10 @@ pub struct Kalem {
     active: Option<usize>,
     sync_active: bool,
     right: Right,
-    /// The right dock is docked (true) or collapsed to an edge strip that slides open on click.
-    right_pinned: bool,
-    /// Auto-hide mode only: the panel is currently slid out over the editor.
-    right_open: bool,
-    /// False once the dock has been closed; View > Solution Explorer / Git Changes bring it back.
-    right_shown: bool,
+    /// Panels collapsed to the edge strip (the others are docked, as tabs of the right dock).
+    right_auto: Vec<Right>,
+    /// The auto-hidden panel that is currently slid out over the editor.
+    right_fly: Option<Right>,
     bottom: Bottom,
     region: Region,
     git: Result<Status, String>,
@@ -541,9 +591,8 @@ impl Kalem {
             active: None,
             sync_active: true,
             right: Right::Explorer,
-            right_pinned: true,
-            right_open: false,
-            right_shown: true,
+            right_auto: Vec::new(),
+            right_fly: None,
             bottom: Bottom::Output,
             region: Region::Editor,
             git: Err("No folder open".into()),
@@ -891,38 +940,72 @@ impl Kalem {
                 return;
             }
         }
-        let Some(ws) = &self.ws else { return };
-        let text = match ws.read_file(rel) {
-            Ok(t) => t,
-            Err(e) => {
-                self.message = Some(e);
-                cx.notify();
-                return;
+        // The file is open in an editable diff: that editor is the file, so both show one text.
+        let shared = self
+            .tabs
+            .iter()
+            .find(|t| t.diff.as_ref().is_some_and(|d| d.live.is_some()) && t.path == rel)
+            .map(|t| (t.editor.clone(), t.saved.clone(), t.dirty));
+        let (editor, saved, dirty) = match shared {
+            Some(s) => s,
+            None => {
+                let Some(ws) = &self.ws else { return };
+                let text = match ws.read_file(rel) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        self.message = Some(e);
+                        cx.notify();
+                        return;
+                    }
+                };
+                let editor = Self::file_editor(rel, &text, window, cx);
+                (editor, text.into(), false)
             }
         };
-        let lang = language_for(rel);
-        let init = text.clone();
-        let editor = cx.new(|cx| {
-            let mut s = EditorState::new(window, cx);
-            if let Some(l) = lang {
-                s = s.language(l);
-            }
-            s.line_number(true).default_value(init)
-        });
-        let saved: SharedString = text.into();
         let sub = self.track_dirty(&editor, cx);
         self.lsp_attach(rel, &editor, cx);
         self.tabs.push(OpenTab {
             path: rel.to_string(),
             editor,
             saved,
-            dirty: false,
+            dirty,
             _sub: sub,
             diff: None,
             marks: None,
         });
         self.message = None;
         self.activate(self.tabs.len() - 1, cx);
+    }
+
+    /// An editor holding the text of a file, with its language and line numbers.
+    fn file_editor(
+        rel: &str,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<EditorState> {
+        let lang = language_for(rel);
+        let init = text.to_string();
+        cx.new(|cx| {
+            let mut s = EditorState::new(window, cx);
+            if let Some(l) = lang {
+                s = s.language(l);
+            }
+            s.line_number(true).default_value(init)
+        })
+    }
+
+    /// The text the left side of an editable diff starts from: the index version, nothing for a
+    /// new file. `None` when git cannot say.
+    fn diff_base(&self, path: &str, untracked: bool) -> Option<String> {
+        if untracked {
+            return Some(String::new());
+        }
+        let ws = self.ws.as_ref()?;
+        GitCli
+            .index_text(&ws.root, path)
+            .ok()
+            .map(Option::unwrap_or_default)
     }
 
     /// Compute the diff of one file for a diff tab.
@@ -936,14 +1019,7 @@ impl Kalem {
             Err(e) => (Default::default(), Some(vcs_error_text(&e))),
         };
         let rows: Vec<DiffRow> = diff.rows();
-        DiffDoc {
-            path: path.to_string(),
-            staged,
-            untracked,
-            diff,
-            rows,
-            error,
-        }
+        DiffDoc::new(path.to_string(), staged, untracked, diff, rows, error)
     }
 
     /// Show what changed in a file (Git Changes panel click), side by side, in an editor tab.
@@ -956,24 +1032,81 @@ impl Kalem {
         cx: &mut Context<Self>,
     ) {
         let path = path.trim_end_matches('/');
-        let doc = Rc::new(self.make_diff(path, staged, untracked));
+        let doc = self.make_diff(path, staged, untracked);
         let existing = self.tabs.iter().position(|t| {
             t.diff
                 .as_ref()
                 .is_some_and(|d| d.path == path && d.staged == staged)
         });
+        // The working-tree side of a text file is edited right in the diff.
+        let editable = !staged && doc.error.is_none() && !doc.diff.binary && !doc.rows.is_empty();
+        let mut file: Option<(Entity<EditorState>, SharedString, bool)> = None;
+        let mut live = None;
+        if editable {
+            if let Some(ix) = existing {
+                if let Some(l) = self.tabs[ix].diff.as_ref().and_then(|d| d.live.clone()) {
+                    file = Some((
+                        self.tabs[ix].editor.clone(),
+                        self.tabs[ix].saved.clone(),
+                        self.tabs[ix].dirty,
+                    ));
+                    live = Some(l);
+                }
+            }
+            if live.is_none() {
+                let open = self
+                    .tabs
+                    .iter()
+                    .find(|t| t.diff.is_none() && t.path == path)
+                    .map(|t| (t.editor.clone(), t.saved.clone(), t.dirty));
+                let text = match &open {
+                    Some((_, saved, _)) => Some(saved.to_string()),
+                    None => self.ws.as_ref().and_then(|w| w.read_file(path).ok()),
+                };
+                let base = self.diff_base(path, untracked);
+                if let (Some(text), Some(base)) = (text, base) {
+                    if text.len() < 1_000_000 && base.len() < 1_000_000 {
+                        let right = match &open {
+                            Some((e, _, _)) => e.clone(),
+                            None => Self::file_editor(path, &text, window, cx),
+                        };
+                        let left = Self::file_editor(path, &base, window, cx);
+                        let l = Rc::new(Live::new(left, right.clone(), base, cx));
+                        l.refresh(self.dark, cx);
+                        file = Some(match open {
+                            Some(o) => o,
+                            None => (right, text.into(), false),
+                        });
+                        live = Some(l);
+                    }
+                }
+            }
+        }
+        let doc = Rc::new(doc.with_live(live));
         if let Some(ix) = existing {
             self.tabs[ix].diff = Some(doc);
+            if let Some((e, saved, dirty)) = file {
+                self.tabs[ix].editor = e;
+                self.tabs[ix].saved = saved;
+                self.tabs[ix].dirty = dirty;
+            }
             self.activate(ix, cx);
             return;
         }
-        let editor = cx.new(|cx| EditorState::new(window, cx));
+        let (editor, saved, dirty) = match file {
+            Some(f) => f,
+            None => (
+                cx.new(|cx| EditorState::new(window, cx)),
+                SharedString::default(),
+                false,
+            ),
+        };
         let sub = self.track_dirty(&editor, cx);
         self.tabs.push(OpenTab {
             path: path.to_string(),
             editor,
-            saved: SharedString::default(),
-            dirty: false,
+            saved,
+            dirty,
             _sub: sub,
             diff: Some(doc),
             marks: None,
@@ -988,6 +1121,17 @@ impl Kalem {
                 continue;
             };
             let fresh = self.make_diff(&d.path, d.staged, d.untracked);
+            fresh.unified.set(d.unified.get());
+            // An editable diff keeps its editors; only the old side may have moved (staging).
+            if let Some(live) = &d.live {
+                if let Some(base) = self.diff_base(&d.path, d.untracked) {
+                    if *live.base.borrow() != base {
+                        *live.base.borrow_mut() = base;
+                        live.base_stale.set(true);
+                    }
+                }
+            }
+            let fresh = fresh.with_live(d.live.clone());
             self.tabs[i].diff = Some(Rc::new(fresh));
         }
     }
@@ -1013,20 +1157,59 @@ impl Kalem {
         }
     }
 
-    /// Select a tab of the right dock and make sure it can be seen: reopen a closed dock, slide
-    /// an auto-hidden one out.
-    fn reveal_right(&mut self, which: Right) {
-        self.right = which;
-        self.right_shown = true;
-        if !self.right_pinned {
-            self.right_open = true;
+    /// The panels the right dock can show right now.
+    fn right_avail(&self) -> Vec<Right> {
+        Right::ALL
+            .into_iter()
+            .filter(|r| *r != Right::Find || self.find_place == FindPlace::Right)
+            .collect()
+    }
+
+    /// Panels that are docked (tabs of the dock), as opposed to collapsed to the edge strip.
+    fn right_docked(&self) -> Vec<Right> {
+        self.right_avail()
+            .into_iter()
+            .filter(|r| !self.right_auto.contains(r))
+            .collect()
+    }
+
+    /// Make sure `self.right` names a docked panel (when there is one).
+    fn fix_right(&mut self) {
+        let docked = self.right_docked();
+        if !docked.contains(&self.right) {
+            if let Some(first) = docked.first() {
+                self.right = *first;
+            }
         }
     }
 
-    fn set_right_pinned(&mut self, pinned: bool, cx: &mut Context<Self>) {
-        self.right_pinned = pinned;
-        // Pinning docks it for good; un-pinning keeps it slid out until the user clicks away.
-        self.right_open = !pinned;
+    /// Show a panel: select its tab when docked, slide it out when collapsed to the strip.
+    fn reveal_right(&mut self, which: Right) {
+        if self.right_auto.contains(&which) {
+            self.right_fly = Some(which);
+        } else {
+            self.right = which;
+        }
+    }
+
+    /// Pin a panel back into the dock.
+    fn dock_right(&mut self, which: Right, cx: &mut Context<Self>) {
+        self.right_auto.retain(|r| *r != which);
+        if self.right_fly == Some(which) {
+            self.right_fly = None;
+        }
+        self.right = which;
+        cx.notify();
+    }
+
+    /// Collapse a panel to the edge strip; it stays there as a vertical tab.
+    fn autohide_right(&mut self, which: Right, cx: &mut Context<Self>) {
+        if !self.right_auto.contains(&which) {
+            self.right_auto.push(which);
+        }
+        // Un-pinning keeps it slid out until the user clicks away.
+        self.right_fly = Some(which);
+        self.fix_right();
         cx.notify();
     }
 
@@ -1050,6 +1233,10 @@ impl Kalem {
             FindPlace::Right => self.reveal_right(Right::Find),
             _ => {
                 // Leaving a dock must not leave an empty tab selected.
+                self.right_auto.retain(|r| *r != Right::Find);
+                if self.right_fly == Some(Right::Find) {
+                    self.right_fly = None;
+                }
                 if self.right == Right::Find {
                     self.right = Right::Explorer;
                 }
@@ -1286,7 +1473,7 @@ impl Kalem {
                                 text,
                                 this.tabs
                                     .iter_mut()
-                                    .find(|t| t.diff.is_none() && &t.path == rel),
+                                    .find(|t| t.edits_file() && &t.path == rel),
                             ) {
                                 tab.saved = text.clone().into();
                                 tab.dirty = false;
@@ -1386,10 +1573,15 @@ impl Kalem {
         cx.subscribe(editor, |this, editor, ev: &InputEvent, cx| {
             if matches!(ev, InputEvent::Change) {
                 let now = editor.read(cx).value();
-                if let Some(t) = this.tabs.iter_mut().find(|t| t.editor == editor) {
+                let dark = this.dark;
+                for t in this.tabs.iter_mut().filter(|t| t.editor == editor) {
                     t.dirty = now != t.saved;
-                    cx.notify();
+                    // An editable diff compares again with every edit.
+                    if let Some(live) = t.diff.as_ref().and_then(|d| d.live.as_ref()) {
+                        live.refresh(dark, cx);
+                    }
                 }
+                cx.notify();
             }
         })
     }
@@ -1593,16 +1785,20 @@ impl Kalem {
         let (Some(ws), Some(ix)) = (&self.ws, self.active) else {
             return;
         };
-        let Some(tab) = self.tabs.get_mut(ix).filter(|t| t.diff.is_none()) else {
+        let Some(tab) = self.tabs.get_mut(ix).filter(|t| t.edits_file()) else {
             return;
         };
         let text = tab.editor.read(cx).value();
+        let editor = tab.editor.clone();
         let mut written = None;
         match ws.write_file(&tab.path, &text) {
             Ok(()) => {
                 written = Some((tab.path.clone(), text.to_string()));
-                tab.saved = text;
-                tab.dirty = false;
+                // Every tab on this editor (the file and its diff) is saved with it.
+                for t in self.tabs.iter_mut().filter(|t| t.editor == editor) {
+                    t.saved = text.clone();
+                    t.dirty = false;
+                }
                 self.message = None;
                 self.refresh(cx);
             }
@@ -2849,14 +3045,11 @@ impl Render for Kalem {
                 this.reveal_right(Right::Git);
                 cx.notify();
             }))
-            .on_action(cx.listener(|this, _: &DockRight, _, cx| this.set_right_pinned(true, cx)))
             .on_action(
-                cx.listener(|this, _: &AutoHideRight, _, cx| this.set_right_pinned(false, cx)),
+                cx.listener(|this, a: &DockRight, _, cx| this.dock_right(Right::from_ix(a.0), cx)),
             )
-            .on_action(cx.listener(|this, _: &CloseRight, _, cx| {
-                this.right_shown = false;
-                this.right_open = false;
-                cx.notify();
+            .on_action(cx.listener(|this, a: &AutoHideRight, _, cx| {
+                this.autohide_right(Right::from_ix(a.0), cx)
             }))
             .on_action(
                 cx.listener(|this, _: &GitSync, w, cx| this.git_op("sync", GitOp::Sync, w, cx)),
@@ -3485,150 +3678,222 @@ impl Render for Kalem {
         } else {
             border
         };
-        let pinned = self.right_pinned;
-        let right_dock = div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .relative()
-            .p(px(4.))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.region = Region::Right;
-                    cx.notify();
-                }),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .h(px(30.))
-                    .pl_2()
-                    .pr_1()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_sm()
-                            .child(match self.right {
-                                Right::Explorer => "Solution Explorer".to_string(),
-                                Right::Git => {
-                                    match self.git.as_ref().ok().and_then(|s| s.branch.clone()) {
-                                        Some(b) => format!("Git Changes - {b}"),
-                                        None => "Git Changes".to_string(),
-                                    }
-                                }
-                                Right::Find => "Find and Replace".to_string(),
-                            }),
-                    )
-                    .child(
-                        Button::new("r-menu")
-                            .ghost()
-                            .compact()
-                            .icon(icon("chevron-down"))
-                            .dropdown_menu(move |m, _, _| {
-                                m.menu_with_check("Dock", pinned, Box::new(DockRight))
-                                    .menu_with_check("Auto Hide", !pinned, Box::new(AutoHideRight))
-                                    .separator()
-                                    .menu("Close", Box::new(CloseRight))
-                            }),
-                    )
-                    .child(
-                        Button::new("r-pin")
-                            .ghost()
-                            .compact()
-                            .icon(icon(if pinned { "pin" } else { "pin-off" }))
-                            .tooltip(if pinned { "Auto Hide" } else { "Keep Docked" })
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.set_right_pinned(!pinned, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new("r-close")
-                            .ghost()
-                            .compact()
-                            .icon(icon("x"))
-                            .tooltip("Close")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.right_shown = false;
-                                this.right_open = false;
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .child(
-                div().flex_1().min_h_0().child(match self.right {
-                    Right::Explorer => explorer.into_any_element(),
-                    Right::Git => git_panel,
-                    Right::Find => div()
-                        .id("find-right-scroll")
-                        .size_full()
-                        .overflow_y_scroll()
-                        .child(self.find_form(true, cx))
-                        .into_any_element(),
-                }),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .top(px(4.))
-                    .left(px(4.))
-                    .right(px(4.))
-                    .bottom(px(32.))
-                    .border_2()
-                    .border_color(right_line)
-                    .rounded(px(5.)),
-            )
-            .child(
-                div()
-                    .flex()
-                    .gap_1()
-                    .px_1()
-                    .h(px(30.))
-                    .child(panel_tab(
-                        "tab-explorer",
-                        "Solution Explorer".into(),
-                        self.right == Right::Explorer,
-                        right_line,
-                        fg,
-                        muted,
-                        bg,
-                        cx.listener(|this, _, _, cx| {
-                            this.right = Right::Explorer;
-                            cx.notify();
+        // Panel contents; each is used once per frame (a docked panel and a slid-out one are
+        // never the same).
+        let mut explorer_el = Some(explorer.into_any_element());
+        let mut git_el = Some(git_panel);
+        let mut find_el = (self.find_place == FindPlace::Right).then(|| {
+            div()
+                .id("find-right-scroll")
+                .size_full()
+                .overflow_y_scroll()
+                .child(self.find_form(true, cx))
+                .into_any_element()
+        });
+        let mut content = |p: Right| -> AnyElement {
+            match p {
+                Right::Explorer => explorer_el.take(),
+                Right::Git => git_el.take(),
+                Right::Find => find_el.take(),
+            }
+            .unwrap_or_else(|| div().into_any_element())
+        };
+        let branch_title = self.git.as_ref().ok().and_then(|s| s.branch.clone());
+        let title_of = |p: Right| match (p, &branch_title) {
+            (Right::Git, Some(b)) => format!("Git Changes - {b}"),
+            _ => p.title().to_string(),
+        };
+
+        // Title bar: name, window position menu, pin, close.
+        let header = |p: Right, docked: bool| {
+            let (ix, id) = (p.ix(), docked as usize);
+            div()
+                .flex()
+                .items_center()
+                .h(px(30.))
+                .pl_2()
+                .pr_1()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_sm()
+                        .child(title_of(p)),
+                )
+                .child(
+                    Button::new(("r-menu", id))
+                        .ghost()
+                        .compact()
+                        .icon(icon("chevron-down"))
+                        .dropdown_menu(move |m, _, _| {
+                            m.menu_with_check("Dock", docked, Box::new(DockRight(ix)))
+                                .menu_with_check("Auto Hide", !docked, Box::new(AutoHideRight(ix)))
                         }),
-                    ))
-                    .child(panel_tab(
-                        "tab-git",
-                        format!("Git Changes ({n_changes})"),
-                        self.right == Right::Git,
-                        right_line,
-                        fg,
-                        muted,
-                        bg,
-                        cx.listener(|this, _, _, cx| {
-                            this.right = Right::Git;
+                )
+                .child(
+                    Button::new(("r-pin", id))
+                        .ghost()
+                        .compact()
+                        .icon(icon(if docked { "pin" } else { "pin-off" }))
+                        .tooltip(if docked { "Auto Hide" } else { "Keep Docked" })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if docked {
+                                this.autohide_right(p, cx)
+                            } else {
+                                this.dock_right(p, cx)
+                            }
+                        })),
+                )
+                .child(
+                    Button::new(("r-close", id))
+                        .ghost()
+                        .compact()
+                        .icon(icon("x"))
+                        .tooltip(if docked {
+                            "Hide (it stays on the side strip)"
+                        } else {
+                            "Close"
+                        })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if docked {
+                                this.autohide_right(p, cx);
+                            }
+                            this.right_fly = None;
                             cx.notify();
-                        }),
-                    ))
-                    .when(self.find_place == FindPlace::Right, |d| {
-                        d.child(panel_tab(
-                            "tab-find-right",
-                            "Find".into(),
-                            self.right == Right::Find,
-                            right_line,
-                            fg,
-                            muted,
-                            bg,
-                            cx.listener(|this, _, _, cx| {
-                                this.right = Right::Find;
-                                cx.notify();
-                            }),
-                        ))
+                        })),
+                )
+        };
+
+        // The docked panels: one frame with the active panel and a tab per docked panel.
+        let docked = self.right_docked();
+        let dock_el = (!docked.is_empty()).then(|| {
+            let cur = self.right;
+            div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .relative()
+                .p(px(4.))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.region = Region::Right;
+                        cx.notify();
                     }),
-            );
+                )
+                .child(header(cur, true))
+                .child(div().flex_1().min_h_0().child(content(cur)))
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(4.))
+                        .left(px(4.))
+                        .right(px(4.))
+                        .bottom(px(32.))
+                        .border_2()
+                        .border_color(right_line)
+                        .rounded(px(5.)),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap_1()
+                        .px_1()
+                        .h(px(30.))
+                        .children(docked.iter().map(|&p| {
+                            let (id, label) = match p {
+                                Right::Explorer => {
+                                    ("tab-explorer", "Solution Explorer".to_string())
+                                }
+                                Right::Git => ("tab-git", format!("Git Changes ({n_changes})")),
+                                Right::Find => ("tab-find-right", "Find".to_string()),
+                            };
+                            panel_tab(
+                                id,
+                                label,
+                                cur == p,
+                                right_line,
+                                fg,
+                                muted,
+                                bg,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.right = p;
+                                    cx.notify();
+                                }),
+                            )
+                        })),
+                )
+        });
+
+        // An auto-hidden panel slid out over the editor.
+        let fly = self
+            .right_fly
+            .filter(|p| self.right_auto.contains(p) && self.right_avail().contains(p));
+        let fly_el = fly.map(|p| {
+            div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .p(px(4.))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.region = Region::Right;
+                        cx.notify();
+                    }),
+                )
+                .child(header(p, false))
+                .child(div().flex_1().min_h_0().child(content(p)))
+        });
+
+        // The edge strip: one vertical tab per collapsed panel.
+        let strip_panels: Vec<Right> = self
+            .right_auto
+            .iter()
+            .copied()
+            .filter(|p| self.right_avail().contains(p))
+            .collect();
+        let strip_active = theme.list_active;
+        let strip = (!strip_panels.is_empty()).then(|| {
+            div()
+                .w(px(28.))
+                .flex_none()
+                .h_full()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap_1()
+                .pt_1()
+                .border_l_1()
+                .border_color(border)
+                .children(strip_panels.iter().map(|&p| {
+                    let on = fly == Some(p);
+                    let (w, h) = p.label_size();
+                    div()
+                        .id(("strip", p.ix()))
+                        .w_full()
+                        .py_2()
+                        .flex()
+                        .justify_center()
+                        .cursor_pointer()
+                        .when(on, |d| d.bg(strip_active))
+                        .hover(move |d| d.bg(strip_active))
+                        .child(icon(p.label_icon()).w(px(w)).h(px(h)).text_color(if on {
+                            fg
+                        } else {
+                            muted
+                        }))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.right_fly = if this.right_fly == Some(p) {
+                                None
+                            } else {
+                                Some(p)
+                            };
+                            cx.notify();
+                        }))
+                }))
+        });
 
         // ----------------------------------------------------------- editor
         let sc = StripCtx {
@@ -3650,7 +3915,7 @@ impl Render for Kalem {
                 cx.listener(|this, _, _, cx| {
                     this.region = Region::Editor;
                     // An auto-hidden panel slides away as soon as the user goes back to work.
-                    this.right_open = false;
+                    this.right_fly = None;
                     cx.notify();
                 }),
             )
@@ -3666,6 +3931,7 @@ impl Render for Kalem {
                             theme.foreground,
                             muted,
                             border,
+                            true,
                         ),
                         Some(t) => Editor::new(&t.editor)
                             .appearance(false)
@@ -3884,6 +4150,18 @@ impl Render for Kalem {
             Ok(s) => s.branch.clone().unwrap_or_default(),
             Err(_) => String::new(),
         };
+        // After staging, the old side of an editable diff has to follow the index.
+        let stale = self
+            .active
+            .and_then(|i| self.tabs.get(i))
+            .and_then(|t| t.diff.as_ref())
+            .and_then(|d| d.live.clone())
+            .filter(|l| l.base_stale.replace(false));
+        if let Some(live) = stale {
+            let base = live.base.borrow().clone();
+            live.left.update(cx, |e, cx| e.set_value(base, window, cx));
+            live.refresh(self.dark, cx);
+        }
         let lang = self
             .active
             .and_then(|i| self.tabs.get(i))
@@ -3971,91 +4249,44 @@ impl Render for Kalem {
         let overlay = self.find_overlay(window, cx);
         let rename = self.rename_overlay(cx);
 
-        // The top row: the editor, and the right dock beside it (docked) or slid over it from an
-        // edge strip (auto-hide).
-        let top_row = if !self.right_shown {
-            editor_area.into_any_element()
-        } else if self.right_pinned {
-            h_resizable("top")
+        // The top row: the editor, the docked panels beside it, an auto-hidden panel sliding over
+        // the editor, and the edge strip that lists the collapsed panels.
+        let main = match dock_el {
+            Some(d) => h_resizable("top")
                 .child(resizable_panel().child(editor_area))
-                .child(resizable_panel().size(px(320.)).child(right_dock))
-                .into_any_element()
-        } else {
-            let strip_btn =
-                |id: &'static str, ic: &'static str, tip: &'static str, which: Right| {
-                    let on = self.right == which && self.right_open;
-                    Button::new(id)
-                        .ghost()
-                        .compact()
-                        .icon(icon(ic))
-                        .tooltip(tip)
-                        .selected(on)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if this.right == which && this.right_open {
-                                this.right_open = false;
-                            } else {
-                                this.right = which;
-                                this.right_open = true;
-                            }
-                            cx.notify();
-                        }))
-                };
-            let strip = div()
-                .w(px(34.))
-                .flex_none()
-                .h_full()
-                .flex()
-                .flex_col()
-                .items_center()
-                .gap_1()
-                .py_1()
-                .border_l_1()
-                .border_color(border)
-                .child(strip_btn(
-                    "s-explorer",
-                    "folder",
-                    "Solution Explorer",
-                    Right::Explorer,
-                ))
-                .child(strip_btn("s-git", "git-branch", "Git Changes", Right::Git))
-                .when(self.find_place == FindPlace::Right, |d| {
-                    d.child(strip_btn(
-                        "s-find",
-                        "search",
-                        "Find and Replace",
-                        Right::Find,
-                    ))
-                });
-            div()
-                .size_full()
-                .flex()
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .h_full()
-                        .relative()
-                        .child(editor_area)
-                        .when(self.right_open, |d| {
-                            d.child(
-                                div()
-                                    .absolute()
-                                    .top_0()
-                                    .right_0()
-                                    .bottom_0()
-                                    .w(px(320.))
-                                    .occlude()
-                                    .bg(theme.background)
-                                    .border_l_1()
-                                    .border_color(accent)
-                                    .shadow_lg()
-                                    .child(right_dock),
-                            )
-                        }),
-                )
-                .child(strip)
-                .into_any_element()
+                .child(resizable_panel().size(px(320.)).child(d))
+                .into_any_element(),
+            None => editor_area.into_any_element(),
         };
+        let top_row = div()
+            .size_full()
+            .flex()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .relative()
+                    .child(main)
+                    .when_some(fly_el, |d, el| {
+                        d.child(
+                            div()
+                                .absolute()
+                                .top_0()
+                                .right_0()
+                                .bottom_0()
+                                .w(px(320.))
+                                .occlude()
+                                .bg(theme.background)
+                                .border_2()
+                                .border_color(accent)
+                                .rounded(px(5.))
+                                .shadow_lg()
+                                .child(el),
+                        )
+                    }),
+            )
+            .children(strip);
 
         root.child(
             div().flex_1().min_h_0().child(

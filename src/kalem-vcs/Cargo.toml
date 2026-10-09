@@ -4,3 +4,6 @@ description = "Kalem IDE version control: VCS backends (Git first) and hosting-p
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[dependencies]
+similar = "2"

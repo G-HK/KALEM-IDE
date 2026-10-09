@@ -390,6 +390,7 @@ impl Render for Detached {
                         theme.foreground,
                         sc.muted,
                         sc.border,
+                        false,
                     ),
                     Some(t) => Editor::new(&t.editor)
                         .appearance(false)

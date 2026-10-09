@@ -182,6 +182,111 @@ impl FileDiff {
     }
 }
 
+/// One difference between two versions of a text: these old lines became these new lines (0-based,
+/// end exclusive; an empty range means lines were only added or only removed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LineChange {
+    pub old: std::ops::Range<usize>,
+    pub new: std::ops::Range<usize>,
+}
+
+/// The line-level differences between two texts, in order.
+pub fn line_changes(old: &str, new: &str) -> Vec<LineChange> {
+    use similar::{DiffTag, TextDiff};
+    TextDiff::from_lines(old, new)
+        .ops()
+        .iter()
+        .filter_map(|op| {
+            let (tag, o, n) = op.as_tag_tuple();
+            (tag != DiffTag::Equal).then_some(LineChange { old: o, new: n })
+        })
+        .collect()
+}
+
+/// Char ranges of the changed words in a line.
+pub type Ranges = Vec<(usize, usize)>;
+
+/// Split a line into words, runs of blanks and single punctuation characters.
+fn tokens(chars: &[char]) -> Vec<(usize, usize)> {
+    let class = |c: char| {
+        if c.is_alphanumeric() || c == '_' {
+            0
+        } else if c.is_whitespace() {
+            1
+        } else {
+            2
+        }
+    };
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let k = class(chars[i]);
+        let mut j = i + 1;
+        if k != 2 {
+            while j < chars.len() && class(chars[j]) == k {
+                j += 1;
+            }
+        }
+        out.push((i, j));
+        i = j;
+    }
+    out
+}
+
+/// The words that differ between two versions of a line (longest common subsequence of tokens),
+/// as char ranges in each. Empty when nothing is shared: then the whole line is the edit and the
+/// row tint already says so.
+pub fn changed_words(a: &str, b: &str) -> (Ranges, Ranges) {
+    let (ca, cb): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let (ta, tb) = (tokens(&ca), tokens(&cb));
+    if ta.len() > 300 || tb.len() > 300 {
+        return (Vec::new(), Vec::new());
+    }
+    let same = |i: usize, j: usize| ca[ta[i].0..ta[i].1] == cb[tb[j].0..tb[j].1];
+    let (n, m) = (ta.len(), tb.len());
+    let mut lcs = vec![vec![0u16; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            lcs[i][j] = if same(i, j) {
+                lcs[i + 1][j + 1] + 1
+            } else {
+                lcs[i + 1][j].max(lcs[i][j + 1])
+            };
+        }
+    }
+    if lcs[0][0] == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    let (mut keep_a, mut keep_b) = (vec![false; n], vec![false; m]);
+    let (mut i, mut j) = (0, 0);
+    while i < n && j < m {
+        if same(i, j) {
+            keep_a[i] = true;
+            keep_b[j] = true;
+            i += 1;
+            j += 1;
+        } else if lcs[i + 1][j] >= lcs[i][j + 1] {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    let ranges = |t: &[(usize, usize)], keep: &[bool]| {
+        let mut out: Vec<(usize, usize)> = Vec::new();
+        for (k, &(s, e)) in t.iter().enumerate() {
+            if keep[k] {
+                continue;
+            }
+            match out.last_mut() {
+                Some(last) if last.1 == s => last.1 = e,
+                _ => out.push((s, e)),
+            }
+        }
+        out
+    };
+    (ranges(&ta, &keep_a), ranges(&tb, &keep_b))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,5 +339,58 @@ mod tests {
         assert_eq!((n.added, n.removed), (2, 0));
         assert_eq!(n.hunks[0].lines[1].new_no, Some(2));
         assert!(all_added("").hunks.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod changed_words_tests {
+    use super::*;
+
+    #[test]
+    fn changed_words_are_picked_out() {
+        let (a, b) = changed_words("let x = compute(1);", "let x = compute_all(1, true);");
+        // old: `compute` is not `compute_all`; new: `compute_all` and `, true` are new.
+        assert_eq!(a, vec![(8, 15)]);
+        assert_eq!(b, vec![(8, 19), (21, 27)]);
+        // Nothing in common: the row tint says it all.
+        assert_eq!(changed_words("abc", "xyz"), (Vec::new(), Vec::new()));
+        assert_eq!(changed_words("same", "same"), (Vec::new(), Vec::new()));
+    }
+}
+
+#[cfg(test)]
+mod line_changes_tests {
+    use super::*;
+
+    #[test]
+    fn five_lines_become_one() {
+        let old = "a\nb\nc\nd\ne\nf\ng\n";
+        let new = "a\nX\ng\n";
+        assert_eq!(
+            line_changes(old, new),
+            vec![LineChange {
+                old: 1..6,
+                new: 1..2
+            }]
+        );
+    }
+
+    #[test]
+    fn insertions_deletions_and_equal_texts() {
+        assert!(line_changes("a\nb\n", "a\nb\n").is_empty());
+        assert_eq!(
+            line_changes("a\nc\n", "a\nb\nc\n"),
+            vec![LineChange {
+                old: 1..1,
+                new: 1..2
+            }]
+        );
+        assert_eq!(
+            line_changes("a\nb\nc\n", "a\nc\n"),
+            vec![LineChange {
+                old: 1..2,
+                new: 1..1
+            }]
+        );
     }
 }
