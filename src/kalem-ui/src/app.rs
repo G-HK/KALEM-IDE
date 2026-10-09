@@ -278,6 +278,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("f11", StepInto, None),
         KeyBinding::new("shift-f11", StepOut, None),
         KeyBinding::new("escape", CloseQuick, Some("QuickOpen")),
+        // Redo is Ctrl+Y in the editor already; Ctrl+Shift+Z (Cmd+Shift+Z) is the other habit.
+        KeyBinding::new("secondary-shift-z", input::Redo, Some("Input")),
     ]);
     cx.on_action(|_: &Quit, cx| cx.quit());
 }
@@ -2793,7 +2795,7 @@ impl Render for Kalem {
                     .ghost()
                     .compact()
                     .icon(icon("undo-2"))
-                    .tooltip("Undo")
+                    .tooltip("Undo (Ctrl+Z)")
                     .disabled(self.active.is_none())
                     .on_click(|_, w, cx| w.dispatch_action(Box::new(input::Undo), cx)),
             )
@@ -2802,7 +2804,7 @@ impl Render for Kalem {
                     .ghost()
                     .compact()
                     .icon(icon("redo-2"))
-                    .tooltip("Redo")
+                    .tooltip("Redo (Ctrl+Y)")
                     .disabled(self.active.is_none())
                     .on_click(|_, w, cx| w.dispatch_action(Box::new(input::Redo), cx)),
             )
