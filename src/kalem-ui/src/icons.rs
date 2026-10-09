@@ -47,6 +47,9 @@ svgs!(
     "git-branch",
     "archive",
     "trash",
+    "sun",
+    "moon",
+    "x",
 );
 
 pub fn icon(name: &str) -> Icon {

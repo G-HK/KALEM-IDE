@@ -26,6 +26,15 @@ pub const TOKENS: &[&str] = &[
     "project",
     "solution",
     "lock",
+    // Editor tab colours, one per project (cycled).
+    "tab1",
+    "tab2",
+    "tab3",
+    "tab4",
+    "tab5",
+    "tab6",
+    "tab7",
+    "tab8",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

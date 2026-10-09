@@ -2,6 +2,7 @@
 //! test results. No UI toolkit in here, so the CLI, the GUI and MCP can share it and CI can test it.
 
 pub mod kinds;
+pub mod search;
 pub mod tasks;
 
 pub use kalem_core::explorer::Node;

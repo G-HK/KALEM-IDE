@@ -3621,6 +3621,7 @@ dependencies = [
  "kalem-solution",
  "kalem-test",
  "kalem-vcs",
+ "regex",
 ]
 
 [[package]]

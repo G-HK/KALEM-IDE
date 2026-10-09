@@ -181,6 +181,19 @@ pub fn project_dirs(project_paths: &[String], files: &[String]) -> BTreeSet<Stri
     out
 }
 
+/// Which project a file belongs to: index into `dirs` of the deepest project folder that
+/// contains `path` (used to colour editor tabs by project).
+pub fn project_index(path: &str, dirs: &[String]) -> Option<usize> {
+    dirs.iter()
+        .enumerate()
+        .filter(|(_, d)| {
+            path.strip_prefix(d.as_str())
+                .is_some_and(|r| r.starts_with('/'))
+        })
+        .max_by_key(|(_, d)| d.len())
+        .map(|(i, _)| i)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,6 +234,17 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         assert_eq!(got, want);
+    }
+
+    #[test]
+    fn files_belong_to_the_deepest_project() {
+        let dirs: Vec<String> = ["src/a", "src/a/inner", "web"].map(String::from).to_vec();
+        assert_eq!(project_index("src/a/x.rs", &dirs), Some(0));
+        assert_eq!(project_index("src/a/inner/y.rs", &dirs), Some(1));
+        assert_eq!(project_index("web/Index.razor", &dirs), Some(2));
+        assert_eq!(project_index("README.md", &dirs), None);
+        // A sibling folder that merely starts with the same letters is not inside the project.
+        assert_eq!(project_index("src/ab/x.rs", &dirs), None);
     }
 
     #[test]

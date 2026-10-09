@@ -11,3 +11,4 @@ kalem-solution = { path = "../kalem-solution" }
 kalem-lang = { path = "../kalem-lang" }
 kalem-vcs = { path = "../kalem-vcs" }
 kalem-test = { path = "../kalem-test" }
+regex = "1"

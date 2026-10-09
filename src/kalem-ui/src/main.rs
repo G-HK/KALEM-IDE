@@ -1,6 +1,7 @@
 //! Kalem IDE desktop app. All behaviour that is not drawing lives in `kalem-workspace`.
 
 mod app;
+mod detached;
 mod icons;
 mod theming;
 
