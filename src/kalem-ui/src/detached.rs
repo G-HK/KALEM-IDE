@@ -312,7 +312,12 @@ impl TabHost for Detached {
 
     fn tab_close(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         if ix < self.tabs.len() {
-            self.remove_tab(ix, window, cx);
+            let tab = self.remove_tab(ix, window, cx);
+            if tab.diff.is_none() {
+                if let Some(main) = self.main.upgrade() {
+                    main.update(cx, |k, cx| k.lsp_forget(&tab.path, cx));
+                }
+            }
         }
     }
 

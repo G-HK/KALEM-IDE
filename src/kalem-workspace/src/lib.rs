@@ -3,6 +3,7 @@
 
 pub mod debug;
 pub mod kinds;
+pub mod lsp;
 pub mod search;
 pub mod tasks;
 

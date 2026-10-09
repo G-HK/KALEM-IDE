@@ -35,10 +35,14 @@ use std::rc::Rc;
 use std::time::Duration;
 
 mod debugger;
+mod lsp;
 
 actions!(
     kalem,
     [
+        FindNext,
+        FindPrev,
+        FindNextFile,
         StartDebugging,
         StopDebugging,
         DebugPause,
@@ -232,6 +236,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-f5", RunNoDebug, None),
         KeyBinding::new("secondary-p", QuickOpen, None),
         KeyBinding::new("secondary-shift-f", ShowFind, None),
+        KeyBinding::new("f3", FindNext, None),
+        KeyBinding::new("shift-f3", FindPrev, None),
         KeyBinding::new("alt-left", NavBack, None),
         KeyBinding::new("alt-right", NavForward, None),
         KeyBinding::new("secondary-shift-r", Refresh, None),
@@ -378,6 +384,11 @@ pub struct Kalem {
     find_busy: bool,
     find_query: String,
     find_gen: u64,
+    /// The hit F3 / Shift+F3 last jumped to.
+    find_cur: Option<usize>,
+    /// After a search that F3 started: jump this many hits (1 = first, -1 = last).
+    find_goto: Option<isize>,
+    find_scroll: ScrollHandle,
     _find_subs: Vec<Subscription>,
     /// Project folders (sorted) for colouring tabs by project.
     proj_dirs: Vec<String>,
@@ -393,6 +404,16 @@ pub struct Kalem {
     pending_debug: Option<kalem_workspace::debug::DebugPlan>,
     /// Breakpoints by workspace-relative path (1-based lines).
     breakpoints: std::collections::BTreeMap<String, std::collections::BTreeSet<u32>>,
+    /// Conditions of breakpoints: (workspace-relative path, line) -> expression.
+    bp_conditions: std::collections::BTreeMap<(String, u32), String>,
+    /// The breakpoint whose condition is being edited.
+    cond_edit: Option<(String, u32)>,
+    cond_input: Entity<InputState>,
+    lsp: lsp::LspState,
+    /// Watch expressions, evaluated whenever the program stops.
+    watches: Vec<String>,
+    watch_input: Entity<InputState>,
+    _dbg_subs: Vec<Subscription>,
     /// Where execution is stopped: (workspace-relative path, 1-based line).
     pc: Option<(String, u32)>,
 }
@@ -448,6 +469,30 @@ impl Kalem {
                 )
             })
             .collect();
+        let watch_input = cx.new(|cx| InputState::new(window, cx).placeholder("Add watch (Enter)"));
+        let cond_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Condition, e.g. i == 3 (Enter; empty clears)")
+        });
+        let dbg_subs = vec![
+            cx.subscribe_in(
+                &watch_input,
+                window,
+                |this, _, ev: &InputEvent, window, cx| {
+                    if matches!(ev, InputEvent::PressEnter { .. }) {
+                        this.add_watch(window, cx);
+                    }
+                },
+            ),
+            cx.subscribe_in(
+                &cond_input,
+                window,
+                |this, _, ev: &InputEvent, window, cx| {
+                    if matches!(ev, InputEvent::PressEnter { .. }) {
+                        this.commit_condition(window, cx);
+                    }
+                },
+            ),
+        ];
         let mut me = Self {
             ws: None,
             tree,
@@ -508,12 +553,22 @@ impl Kalem {
             dbg_gen: 0,
             pending_debug: None,
             breakpoints: Default::default(),
+            bp_conditions: Default::default(),
+            cond_edit: None,
+            cond_input,
+            lsp: Default::default(),
+            watches: Vec::new(),
+            watch_input,
+            _dbg_subs: dbg_subs,
             pc: None,
             find_opts: SearchOptions::default(),
             find: None,
             find_busy: false,
             find_query: String::new(),
             find_gen: 0,
+            find_cur: None,
+            find_goto: None,
+            find_scroll: ScrollHandle::new(),
             _find_subs: find_subs,
         };
         me.apply_theme(cx);
@@ -808,6 +863,7 @@ impl Kalem {
         });
         let saved: SharedString = text.into();
         let sub = self.track_dirty(&editor, cx);
+        self.lsp_attach(rel, &editor, cx);
         self.tabs.push(OpenTab {
             path: rel.to_string(),
             editor,
@@ -1046,6 +1102,7 @@ impl Kalem {
                         if this.pending_replace && r.hits.is_empty() {
                             this.find_note = Some("Nothing to replace".into());
                         }
+                        this.find_cur = None;
                         this.find = Some(r);
                     }
                     Err(e) => {
@@ -1056,8 +1113,64 @@ impl Kalem {
                 this.pending_replace = false;
                 cx.notify();
             });
+            // F3 on a fresh query: search first, then jump.
+            let _ = cx.update(|window, cx| {
+                this.update(cx, |this, cx| {
+                    if let Some(d) = this.find_goto.take() {
+                        this.find_step(d, false, window, cx);
+                    }
+                })
+            });
         })
         .detach();
+    }
+
+    /// F3 / Shift+F3 (`delta` +1 / -1): open the next / previous hit of the last search,
+    /// wrapping around. `by_file` skips the remaining hits of the current file.
+    fn find_step(
+        &mut self,
+        delta: isize,
+        by_file: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let n = self.find.as_ref().map(|r| r.hits.len()).unwrap_or(0);
+        if n == 0 {
+            // No results yet: run the search in the Find box, then come back here.
+            if self.find.is_none() && !self.find_input.read(cx).value().is_empty() {
+                self.find_goto = Some(delta);
+                self.run_find(window, cx);
+            }
+            return;
+        }
+        let hits = &self.find.as_ref().unwrap().hits;
+        let start = match self.find_cur {
+            Some(c) => c as isize,
+            None => {
+                if delta > 0 {
+                    -1
+                } else {
+                    n as isize
+                }
+            }
+        };
+        let cur_path = self.find_cur.map(|c| hits[c].path.clone());
+        let mut ix = start;
+        let mut next = None;
+        for _ in 0..n {
+            ix = (ix + delta).rem_euclid(n as isize);
+            if by_file && cur_path.as_deref() == Some(hits[ix as usize].path.as_str()) {
+                continue;
+            }
+            next = Some(ix as usize);
+            break;
+        }
+        let Some(i) = next else { return };
+        let h = hits[i].clone();
+        self.find_cur = Some(i);
+        self.find_scroll.scroll_to_item(i);
+        self.open_at(&h.path, h.line, h.col, window, cx);
+        cx.notify();
     }
 
     fn replace_click(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1197,7 +1310,10 @@ impl Kalem {
 
     fn close_tab(&mut self, ix: usize, cx: &mut Context<Self>) {
         if ix < self.tabs.len() {
-            self.remove_tab(ix, cx);
+            let tab = self.remove_tab(ix, cx);
+            if tab.diff.is_none() {
+                self.lsp_forget(&tab.path, cx);
+            }
         }
     }
 
@@ -1259,6 +1375,7 @@ impl Kalem {
             .as_ref()
             .ok_or_else(|| "No folder open".to_string())?;
         ws.write_file(rel, text)?;
+        self.lsp_saved(rel, text, cx);
         self.refresh(cx);
         Ok(())
     }
@@ -1415,14 +1532,19 @@ impl Kalem {
             return;
         };
         let text = tab.editor.read(cx).value();
+        let mut written = None;
         match ws.write_file(&tab.path, &text) {
             Ok(()) => {
+                written = Some((tab.path.clone(), text.to_string()));
                 tab.saved = text;
                 tab.dirty = false;
                 self.message = None;
                 self.refresh(cx);
             }
             Err(e) => self.message = Some(e),
+        }
+        if let Some((path, text)) = written {
+            self.lsp_saved(&path, &text, cx);
         }
         cx.notify();
     }
@@ -1859,6 +1981,34 @@ impl Kalem {
                     .px_2()
                     .py_1()
                     .child(div().flex_1().text_xs().text_color(muted).child(summary))
+                    .child(
+                        Button::new("f-prev")
+                            .ghost()
+                            .compact()
+                            .icon(icon("arrow-up"))
+                            .tooltip("Find Previous (Shift+F3)")
+                            .on_click(
+                                cx.listener(|this, _, w, cx| this.find_step(-1, false, w, cx)),
+                            ),
+                    )
+                    .child(
+                        Button::new("f-next")
+                            .ghost()
+                            .compact()
+                            .icon(icon("arrow-down"))
+                            .tooltip("Find Next (F3)")
+                            .on_click(
+                                cx.listener(|this, _, w, cx| this.find_step(1, false, w, cx)),
+                            ),
+                    )
+                    .child(
+                        Button::new("f-next-file")
+                            .ghost()
+                            .compact()
+                            .label("Next file")
+                            .tooltip("Skip to the next file with a match")
+                            .on_click(cx.listener(|this, _, w, cx| this.find_step(1, true, w, cx))),
+                    )
                     .when(self.find_place == FindPlace::Hidden, |d| {
                         d.child(
                             Button::new("f-open")
@@ -1876,6 +2026,7 @@ impl Kalem {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
+                    .track_scroll(&self.find_scroll)
                     .children(hits.into_iter().enumerate().map(|(i, h)| {
                         let v = v.clone();
                         let (path, line, col) = (h.path.clone(), h.line, h.col);
@@ -1886,6 +2037,7 @@ impl Kalem {
                             .px_2()
                             .text_sm()
                             .cursor_pointer()
+                            .when(self.find_cur == Some(i), |d| d.bg(list_active))
                             .hover(move |d| d.bg(list_active))
                             .child(
                                 div()
@@ -1896,7 +2048,10 @@ impl Kalem {
                             .child(div().truncate().child(h.text))
                             .on_click(move |_, window, cx| {
                                 let p = path.clone();
-                                v.update(cx, |this, cx| this.open_at(&p, line, col, window, cx));
+                                v.update(cx, |this, cx| {
+                                    this.find_cur = Some(i);
+                                    this.open_at(&p, line, col, window, cx)
+                                });
                             })
                     })),
             )
@@ -2211,6 +2366,9 @@ impl Render for Kalem {
                     .menu("Select All", Box::new(input::SelectAll))
                     .separator()
                     .menu("Find in Files", Box::new(ShowFind))
+                    .menu("Find Next (F3)", Box::new(FindNext))
+                    .menu("Find Previous (Shift+F3)", Box::new(FindPrev))
+                    .menu("Find Next File", Box::new(FindNextFile))
             }))
             .child(m("m-view", "View").dropdown_menu(move |m, w, cx| {
                 let names = theme_names.clone();
@@ -2642,6 +2800,9 @@ impl Render for Kalem {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ShowFind, w, cx| this.show_find(w, cx)))
+            .on_action(cx.listener(|this, _: &FindNext, w, cx| this.find_step(1, false, w, cx)))
+            .on_action(cx.listener(|this, _: &FindPrev, w, cx| this.find_step(-1, false, w, cx)))
+            .on_action(cx.listener(|this, _: &FindNextFile, w, cx| this.find_step(1, true, w, cx)))
             .on_action(cx.listener(|this, _: &FindClose, w, cx| {
                 this.set_find_place(FindPlace::Hidden, w, cx)
             }))
@@ -3530,6 +3691,12 @@ impl Render for Kalem {
             .and_then(|i| self.tabs.get(i))
             .map(|t| language_for(&t.path).unwrap_or("plain text"))
             .unwrap_or("");
+        let lsp_note = self
+            .active
+            .and_then(|i| self.tabs.get(i))
+            .filter(|t| t.diff.is_none())
+            .map(|t| self.lsp_status(&t.path))
+            .unwrap_or_default();
         let proj_name = self
             .active
             .and_then(|i| self.tabs.get(i))
@@ -3555,6 +3722,7 @@ impl Render for Kalem {
             .child(self.status_text.clone())
             .child(branch)
             .child(div().flex_1())
+            .child(lsp_note)
             .child(proj_name)
             .child(self.config.name())
             .child(lang.to_string())

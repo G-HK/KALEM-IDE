@@ -16,6 +16,8 @@ kalem-theme = { path = "../kalem-theme" }
 kalem-vcs = { path = "../kalem-vcs" }
 kalem-test = { path = "../kalem-test" }
 kalem-dap = { path = "../kalem-dap" }
+kalem-lsp = { path = "../kalem-lsp" }
+anyhow = "1"
 gpui-kit = { version = "0.7", features = [
   "tree-sitter-rust", "tree-sitter-python", "tree-sitter-javascript", "tree-sitter-typescript",
   "tree-sitter-tsx", "tree-sitter-go", "tree-sitter-java", "tree-sitter-kotlin", "tree-sitter-c",

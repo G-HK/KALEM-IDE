@@ -1,7 +1,7 @@
 //! Drives a real `gdb --interpreter=dap` through a whole session. Skipped (with a note) on
 //! machines without gdb 14+ or a C compiler, so CI on macOS and Windows stays green.
 
-use kalem_dap::{DebugEvent, LaunchConfig, Session};
+use kalem_dap::{DebugEvent, LaunchConfig, Session, SourceBreakpoint};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
@@ -82,7 +82,7 @@ fn breakpoint_stack_variables_step_and_exit() {
     assert!(ok, "could not compile the test program");
 
     let mut bps = HashMap::new();
-    bps.insert(src.display().to_string(), vec![3u32]); // `int sum = a + b;`
+    bps.insert(src.display().to_string(), vec![SourceBreakpoint::at(3)]); // `int sum = a + b;`
     let session = Session::start(
         "gdb",
         &[],
@@ -133,6 +133,77 @@ fn breakpoint_stack_variables_step_and_exit() {
     );
 
     // Run to the end.
+    session.resume(tid).unwrap();
+    wait_for(&session, 30, |e| {
+        matches!(e, DebugEvent::Exited(_) | DebugEvent::Terminated)
+    });
+    session.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn conditions_and_watch_expressions() {
+    if !gdb_has_dap() || have("cc", "--version").is_none() || cfg!(windows) {
+        eprintln!("skipped: needs gdb >= 14 and a C compiler");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("kalem-dap-gdb-cond-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (src, exe) = (dir.join("prog.c"), dir.join("prog"));
+    std::fs::write(&src, PROGRAM).unwrap();
+    let ok = Command::new("cc")
+        .args(["-g", "-O0", "-o"])
+        .arg(&exe)
+        .arg(&src)
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok, "could not compile the test program");
+
+    // Line 3 only when a == 3 (true for the one call), and line 9 never (x == 99).
+    let mut bps = HashMap::new();
+    bps.insert(
+        src.display().to_string(),
+        vec![
+            SourceBreakpoint {
+                line: 3,
+                condition: Some("a == 3".into()),
+            },
+            SourceBreakpoint {
+                line: 9,
+                condition: Some("x == 99".into()),
+            },
+        ],
+    );
+    let session = Session::start(
+        "gdb",
+        &[],
+        &LaunchConfig {
+            program: exe.display().to_string(),
+            cwd: Some(dir.clone()),
+            ..Default::default()
+        },
+        &bps,
+    )
+    .expect("session starts");
+
+    let stopped = wait_for(&session, 30, |e| matches!(e, DebugEvent::Stopped { .. }));
+    let DebugEvent::Stopped { thread_id, .. } = stopped else {
+        unreachable!()
+    };
+    let tid = thread_id
+        .or_else(|| session.threads().unwrap().first().map(|t| t.id))
+        .expect("a thread");
+    let frames = session.stack_trace(tid).unwrap();
+    assert_eq!(frames[0].name, "add");
+    assert_eq!(frames[0].line, 3);
+
+    let w = session.evaluate("a + b", Some(frames[0].id)).unwrap();
+    assert_eq!(w.value, "7");
+    assert!(session
+        .evaluate("no_such_name", Some(frames[0].id))
+        .is_err());
+
     session.resume(tid).unwrap();
     wait_for(&session, 30, |e| {
         matches!(e, DebugEvent::Exited(_) | DebugEvent::Terminated)

@@ -7,9 +7,9 @@ use super::*;
 use gpui_kit::component::input::{
     RangeDecoration, RangeDecorationCollection, RangeDecorationStyle,
 };
-use kalem_dap::{DebugEvent, LaunchConfig, Session, StackFrame, Variable};
+use kalem_dap::{DebugEvent, LaunchConfig, Session, SourceBreakpoint, StackFrame, Variable};
 use kalem_workspace::debug::DebugPlan;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -38,6 +38,12 @@ pub(super) struct DebugState {
     vars: Vec<(String, Vec<Variable>)>,
     /// Files whose breakpoints the adapter has been told about (so cleared ones are cleared).
     known_files: BTreeSet<String>,
+    /// Children of expanded variables, by tree key (see `Kalem::var_rows`).
+    children: HashMap<String, Vec<Variable>>,
+    /// Keys of the expanded variables; kept across steps so the tree stays open.
+    open: BTreeSet<String>,
+    /// One result per watch expression, in order.
+    watch_vals: Vec<Result<Variable, String>>,
 }
 
 #[derive(Clone, Copy)]
@@ -86,6 +92,59 @@ fn snapshot(s: &Session, thread: Option<i64>) -> Snapshot {
     }
 }
 
+/// Key of a variable in the expansion tree: scope and name, then names down the path.
+fn var_key(parent: &str, name: &str) -> String {
+    format!("{parent}/{name}")
+}
+
+type WatchResults = Vec<Result<Variable, String>>;
+
+/// Evaluate the watches in a frame and fetch the children of every expanded variable
+/// (their references are only valid while the program stays stopped, so they are re-read
+/// after each stop).
+fn views(
+    s: &Session,
+    frame_id: i64,
+    watches: &[String],
+    vars: &[(String, Vec<Variable>)],
+    open: &BTreeSet<String>,
+) -> (WatchResults, HashMap<String, Vec<Variable>>) {
+    let watched: WatchResults = watches
+        .iter()
+        .map(|w| {
+            s.evaluate(w, Some(frame_id))
+                .map_err(|e| e.to_string().lines().next().unwrap_or("error").to_string())
+        })
+        .collect();
+    let mut refs: HashMap<String, i64> = HashMap::new();
+    for (scope, list) in vars {
+        for v in list {
+            refs.insert(var_key(scope, &v.name), v.variables_reference);
+        }
+    }
+    for (i, w) in watched.iter().enumerate() {
+        if let Ok(v) = w {
+            refs.insert(format!("watch:{i}"), v.variables_reference);
+        }
+    }
+    // Parents before children: shallower keys first.
+    let mut keys: Vec<&String> = open.iter().collect();
+    keys.sort_by_key(|k| k.matches('/').count());
+    let mut children = HashMap::new();
+    for key in keys {
+        let Some(&r) = refs.get(key).filter(|r| **r > 0) else {
+            continue;
+        };
+        let mut list = s.variables(r).unwrap_or_default();
+        list.truncate(MAX_VARS);
+        for c in &list {
+            refs.insert(var_key(key, &c.name), c.variables_reference);
+        }
+        children.insert(key.clone(), list);
+    }
+    (watched, children)
+}
+
 /// Byte ranges of whole lines (1-based numbers), including the line break.
 fn line_ranges(text: &str, lines: &[u32]) -> Vec<Range<usize>> {
     let mut starts = vec![0usize];
@@ -112,6 +171,9 @@ impl DebugState {
             frame_ix: 0,
             vars: Vec::new(),
             known_files: BTreeSet::new(),
+            children: HashMap::new(),
+            open: BTreeSet::new(),
+            watch_vals: Vec::new(),
         }
     }
 }
@@ -137,7 +199,7 @@ impl Kalem {
     }
 
     /// Workspace-relative path (with `/`) of an absolute file, if it is inside the workspace.
-    fn rel_of(&self, abs: &str) -> Option<String> {
+    pub(super) fn rel_of(&self, abs: &str) -> Option<String> {
         let root = self
             .ws
             .as_ref()?
@@ -166,10 +228,25 @@ impl Kalem {
 
     // ------------------------------------------------------ breakpoints
 
-    fn abs_breakpoints(&self) -> std::collections::HashMap<String, Vec<u32>> {
+    /// The breakpoints of one file with their conditions.
+    fn source_bps(&self, rel: &str) -> Vec<SourceBreakpoint> {
         self.breakpoints
-            .iter()
-            .filter_map(|(rel, lines)| Some((self.abs_of(rel)?, lines.iter().copied().collect())))
+            .get(rel)
+            .map(|set| {
+                set.iter()
+                    .map(|&line| SourceBreakpoint {
+                        line,
+                        condition: self.bp_conditions.get(&(rel.to_string(), line)).cloned(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn abs_breakpoints(&self) -> HashMap<String, Vec<SourceBreakpoint>> {
+        self.breakpoints
+            .keys()
+            .filter_map(|rel| Some((self.abs_of(rel)?, self.source_bps(rel))))
             .collect()
     }
 
@@ -185,7 +262,9 @@ impl Kalem {
         let line = tab.editor.read(cx).cursor_position().line + 1;
         let path = tab.path.clone();
         let set = self.breakpoints.entry(path.clone()).or_default();
-        if !set.remove(&line) {
+        if set.remove(&line) {
+            self.bp_conditions.remove(&(path.clone(), line));
+        } else {
             set.insert(line);
         }
         self.sync_breakpoints(&path, cx);
@@ -195,7 +274,141 @@ impl Kalem {
         if let Some(set) = self.breakpoints.get_mut(path) {
             set.remove(&line);
         }
+        self.bp_conditions.remove(&(path.to_string(), line));
+        if self.cond_edit.as_ref() == Some(&(path.to_string(), line)) {
+            self.cond_edit = None;
+        }
         self.sync_breakpoints(path, cx);
+    }
+
+    /// Start editing the condition of a breakpoint (the input in the Breakpoints column).
+    fn edit_condition(
+        &mut self,
+        path: &str,
+        line: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let current = self
+            .bp_conditions
+            .get(&(path.to_string(), line))
+            .cloned()
+            .unwrap_or_default();
+        self.cond_edit = Some((path.to_string(), line));
+        self.cond_input.update(cx, |i, cx| {
+            i.set_value(current, window, cx);
+            i.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    pub(super) fn commit_condition(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((path, line)) = self.cond_edit.take() else {
+            return;
+        };
+        let text = self.cond_input.read(cx).value().trim().to_string();
+        if text.is_empty() {
+            self.bp_conditions.remove(&(path.clone(), line));
+        } else if self
+            .breakpoints
+            .get(&path)
+            .is_some_and(|s| s.contains(&line))
+        {
+            self.bp_conditions.insert((path.clone(), line), text);
+        }
+        self.cond_input
+            .update(cx, |i, cx| i.set_value("", window, cx));
+        self.sync_breakpoints(&path, cx);
+    }
+
+    // ---------------------------------------------------------- watches
+
+    pub(super) fn add_watch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.watch_input.read(cx).value().trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        self.watch_input
+            .update(cx, |i, cx| i.set_value("", window, cx));
+        if !self.watches.contains(&text) {
+            self.watches.push(text);
+        }
+        self.refresh_views(cx);
+        cx.notify();
+    }
+
+    fn remove_watch(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if ix < self.watches.len() {
+            self.watches.remove(ix);
+            if let Some(d) = self.dbg.as_mut() {
+                // Expansion keys of later watches shift by one: collapse them all.
+                d.open.retain(|k| !k.starts_with("watch:"));
+            }
+            self.refresh_views(cx);
+            cx.notify();
+        }
+    }
+
+    /// Re-evaluate the watches and re-read the expanded variables of the selected frame.
+    fn refresh_views(&mut self, cx: &mut Context<Self>) {
+        let watches = self.watches.clone();
+        let Some(d) = self.dbg.as_mut() else { return };
+        if !matches!(d.status, Status::Paused(_)) {
+            d.watch_vals.clear();
+            return;
+        }
+        let (Some(s), Some(frame)) = (d.session.clone(), d.frames.get(d.frame_ix).map(|f| f.id))
+        else {
+            return;
+        };
+        let (gen, ix, vars, open) = (d.gen, d.frame_ix, d.vars.clone(), d.open.clone());
+        cx.spawn(async move |this, cx| {
+            let (watched, children) = cx
+                .background_executor()
+                .spawn(async move { views(&s, frame, &watches, &vars, &open) })
+                .await;
+            let _ = this.update(cx, |k, cx| {
+                if let Some(d) = k
+                    .dbg
+                    .as_mut()
+                    .filter(|d| d.gen == gen && d.frame_ix == ix)
+                    .filter(|d| matches!(d.status, Status::Paused(_)))
+                {
+                    d.watch_vals = watched;
+                    d.children = children;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Expand or collapse a variable (fetching its children the first time).
+    fn toggle_var(&mut self, key: String, reference: i64, cx: &mut Context<Self>) {
+        let Some(d) = self.dbg.as_mut() else { return };
+        if !d.open.remove(&key) {
+            d.open.insert(key.clone());
+            if reference > 0 && !d.children.contains_key(&key) {
+                if let Some(s) = d.session.clone() {
+                    let gen = d.gen;
+                    cx.spawn(async move |this, cx| {
+                        let mut list = cx
+                            .background_executor()
+                            .spawn(async move { s.variables(reference).unwrap_or_default() })
+                            .await;
+                        list.truncate(MAX_VARS);
+                        let _ = this.update(cx, |k, cx| {
+                            if let Some(d) = k.dbg.as_mut().filter(|d| d.gen == gen) {
+                                d.children.insert(key, list);
+                                cx.notify();
+                            }
+                        });
+                    })
+                    .detach();
+                }
+            }
+        }
+        cx.notify();
     }
 
     /// Redraw the markers and, while debugging, tell the adapter.
@@ -206,14 +419,10 @@ impl Kalem {
         self.apply_marks(cx);
         let session = self.dbg.as_ref().and_then(|d| d.session.clone());
         if let (Some(s), Some(abs)) = (session, self.abs_of(path)) {
-            let lines: Vec<u32> = self
-                .breakpoints
-                .get(path)
-                .map(|s| s.iter().copied().collect())
-                .unwrap_or_default();
+            let bps = self.source_bps(path);
             cx.background_executor()
                 .spawn(async move {
-                    let _ = s.set_breakpoints(&abs, &lines);
+                    let _ = s.set_breakpoints(&abs, &bps);
                 })
                 .detach();
         }
@@ -520,6 +729,7 @@ impl Kalem {
         self.status_text = format!("Debugging: paused ({text})");
         self.bottom = Bottom::Debug;
         self.show_frame_source(top, window, cx);
+        self.refresh_views(cx);
     }
 
     /// Open the file of a frame at its line and mark it as the current line.
@@ -580,6 +790,8 @@ impl Kalem {
             d.status = Status::Running;
             d.frames.clear();
             d.vars.clear();
+            d.children.clear();
+            d.watch_vals.clear();
         }
         self.pc = None;
         self.apply_marks(cx);
@@ -589,7 +801,7 @@ impl Kalem {
 
     /// Every file's breakpoints, to send before the program runs on: some adapters (gdb)
     /// cannot change breakpoints while the program runs, so edits made then are applied now.
-    fn breakpoint_sync(&mut self) -> Vec<(String, Vec<u32>)> {
+    fn breakpoint_sync(&mut self) -> Vec<(String, Vec<SourceBreakpoint>)> {
         let mut files: BTreeSet<String> = self.breakpoints.keys().cloned().collect();
         if let Some(d) = self.dbg.as_mut() {
             files.extend(d.known_files.iter().cloned());
@@ -597,14 +809,7 @@ impl Kalem {
         }
         files
             .into_iter()
-            .filter_map(|rel| {
-                let lines = self
-                    .breakpoints
-                    .get(&rel)
-                    .map(|s| s.iter().copied().collect())
-                    .unwrap_or_default();
-                Some((self.abs_of(&rel)?, lines))
-            })
+            .filter_map(|rel| Some((self.abs_of(&rel)?, self.source_bps(&rel))))
             .collect()
     }
 
@@ -615,8 +820,8 @@ impl Kalem {
         let sync = self.breakpoint_sync();
         self.mark_running(cx);
         self.run_in_background(cx, "Continue", move |s, t| {
-            for (file, lines) in &sync {
-                let _ = s.set_breakpoints(file, lines);
+            for (file, bps) in &sync {
+                let _ = s.set_breakpoints(file, bps);
             }
             s.resume(t)
         });
@@ -629,8 +834,8 @@ impl Kalem {
         let sync = self.breakpoint_sync();
         self.mark_running(cx);
         self.run_in_background(cx, "Step", move |s, t| {
-            for (file, lines) in &sync {
-                let _ = s.set_breakpoints(file, lines);
+            for (file, bps) in &sync {
+                let _ = s.set_breakpoints(file, bps);
             }
             match step {
                 Step::Over => s.next(t),
@@ -679,8 +884,11 @@ impl Kalem {
                 .spawn(async move { frame_vars(&s, frame.id) })
                 .await;
             let _ = this.update(cx, |k, cx| {
-                if let Some(d) = k.dbg.as_mut().filter(|d| d.gen == gen && d.frame_ix == ix) {
+                let mine = k.dbg.as_mut().filter(|d| d.gen == gen && d.frame_ix == ix);
+                if let Some(d) = mine {
                     d.vars = vars;
+                    d.children.clear();
+                    k.refresh_views(cx);
                     cx.notify();
                 }
             });
@@ -690,7 +898,76 @@ impl Kalem {
 
     // ------------------------------------------------------------ panel
 
-    /// The Debug tab: Call Stack | Variables | Breakpoints.
+    fn watch_remove_button(&self, i: usize, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .id(("watch-del", i))
+            .ml_2()
+            .cursor_pointer()
+            .text_color(cx.theme().muted_foreground)
+            .child("x")
+            .on_click(cx.listener(move |this, _, _, cx| this.remove_watch(i, cx)))
+            .into_any_element()
+    }
+
+    /// One variable row, followed by its children when it is expanded. `watch` is the index
+    /// of the watch expression this row is the root of (it gets a remove button).
+    fn var_rows(
+        &self,
+        key: String,
+        v: &Variable,
+        depth: usize,
+        watch: Option<usize>,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let muted = cx.theme().muted_foreground;
+        let expandable = v.variables_reference > 0;
+        let open = self.dbg.as_ref().is_some_and(|d| d.open.contains(&key));
+        let reference = v.variables_reference;
+        let toggle_key = key.clone();
+        let row = div()
+            .id(SharedString::from(key.clone()))
+            .flex()
+            .gap_1()
+            .pl(px(8. + depth as f32 * 14.))
+            .pr_2()
+            .text_sm()
+            .font_family("monospace")
+            .when(expandable, |d| d.cursor_pointer())
+            .child(
+                div()
+                    .w(px(10.))
+                    .text_color(muted)
+                    .child(match (expandable, open) {
+                        (false, _) => "",
+                        (true, false) => ">",
+                        (true, true) => "v",
+                    }),
+            )
+            .child(v.name.clone())
+            .child(div().text_color(muted).child("="))
+            .child(v.value.clone())
+            .when_some(v.type_name.clone(), |d, t| {
+                d.child(div().text_xs().text_color(muted).child(t))
+            })
+            .when_some(watch, |d, i| d.child(self.watch_remove_button(i, cx)))
+            .when(expandable, |d| {
+                d.on_click(cx.listener(move |this, _, _, cx| {
+                    this.toggle_var(toggle_key.clone(), reference, cx)
+                }))
+            })
+            .into_any_element();
+        let mut rows = vec![row];
+        if open {
+            if let Some(kids) = self.dbg.as_ref().and_then(|d| d.children.get(&key)) {
+                for c in kids {
+                    rows.extend(self.var_rows(var_key(&key, &c.name), c, depth + 1, None, cx));
+                }
+            }
+        }
+        rows
+    }
+
+    /// The Debug tab: Call Stack | Variables | Watch | Breakpoints.
     pub(super) fn debug_panel(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
         let muted = theme.muted_foreground;
@@ -768,19 +1045,40 @@ impl Kalem {
                         .child(scope.clone()),
                 );
                 for v in list {
-                    vars = vars.child(
+                    let key = var_key(scope, &v.name);
+                    for row in self.var_rows(key, v, 0, None, cx) {
+                        vars = vars.child(row);
+                    }
+                }
+            }
+        }
+
+        // Watches.
+        let mut watch = column("dbg-watch", "Watch".into())
+            .child(div().px_2().pb_1().child(Input::new(&self.watch_input)));
+        for (i, expr) in self.watches.iter().enumerate() {
+            let val = self.dbg.as_ref().and_then(|d| d.watch_vals.get(i));
+            match val {
+                Some(Ok(v)) => {
+                    for row in self.var_rows(format!("watch:{i}"), v, 0, Some(i), cx) {
+                        watch = watch.child(row);
+                    }
+                }
+                other => {
+                    let note = match other {
+                        Some(Err(e)) => e.clone(),
+                        _ => String::new(),
+                    };
+                    watch = watch.child(
                         div()
                             .flex()
                             .gap_2()
                             .px_3()
                             .text_sm()
                             .font_family("monospace")
-                            .child(v.name.clone())
-                            .child(div().text_color(muted).child("="))
-                            .child(v.value.clone())
-                            .when_some(v.type_name.clone(), |d, t| {
-                                d.child(div().text_xs().text_color(muted).child(t))
-                            }),
+                            .child(expr.clone())
+                            .child(div().text_color(muted).child(note))
+                            .child(self.watch_remove_button(i, cx)),
                     );
                 }
             }
@@ -793,7 +1091,7 @@ impl Kalem {
         for (path, lines) in &self.breakpoints {
             for &line in lines {
                 n += 1;
-                let (p_open, p_del) = (path.clone(), path.clone());
+                let (p_open, p_del, p_cond) = (path.clone(), path.clone(), path.clone());
                 bps = bps.child(
                     div()
                         .id(("bp", n))
@@ -810,9 +1108,23 @@ impl Kalem {
                                 .min_w_0()
                                 .truncate()
                                 .cursor_pointer()
-                                .child(format!("{path}:{line}"))
+                                .child(match self.bp_conditions.get(&(path.clone(), line)) {
+                                    Some(c) => format!("{path}:{line}   if {c}"),
+                                    None => format!("{path}:{line}"),
+                                })
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     this.open_at(&p_open, line as usize, 0, window, cx)
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id(("bp-cond", n))
+                                .cursor_pointer()
+                                .text_xs()
+                                .text_color(muted)
+                                .child("if")
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.edit_condition(&p_cond, line, window, cx)
                                 })),
                         )
                         .child(
@@ -827,6 +1139,18 @@ impl Kalem {
                         ),
                 );
             }
+        }
+
+        if let Some((p, l)) = &self.cond_edit {
+            bps = bps.child(
+                div()
+                    .px_2()
+                    .pt_1()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(format!("Condition for {p}:{l}")),
+            );
+            bps = bps.child(div().px_2().child(Input::new(&self.cond_input)));
         }
 
         div()
@@ -855,6 +1179,7 @@ impl Kalem {
                     .flex()
                     .child(stack)
                     .child(vars)
+                    .child(watch)
                     .child(bps),
             )
             .into_any_element()

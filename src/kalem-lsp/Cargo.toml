@@ -1,6 +1,12 @@
 [package]
 name = "kalem-lsp"
-description = "Kalem IDE Language Server Protocol client (planned)"
+description = "Kalem IDE Language Server Protocol client"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+lsp-types = "0.97"
+percent-encoding = "2"

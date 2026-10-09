@@ -3563,6 +3563,12 @@ dependencies = [
 [[package]]
 name = "kalem-lsp"
 version = "0.0.1"
+dependencies = [
+ "lsp-types",
+ "percent-encoding",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "kalem-solution"
@@ -3603,9 +3609,11 @@ dependencies = [
 name = "kalem-ui"
 version = "0.0.1"
 dependencies = [
+ "anyhow",
  "gpui-kit",
  "kalem-core",
  "kalem-dap",
+ "kalem-lsp",
  "kalem-test",
  "kalem-theme",
  "kalem-vcs",

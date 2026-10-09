@@ -48,6 +48,22 @@ impl LaunchConfig {
     }
 }
 
+/// A breakpoint the IDE wants set: a 1-based line, optionally only when `condition` is true.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SourceBreakpoint {
+    pub line: u32,
+    pub condition: Option<String>,
+}
+
+impl SourceBreakpoint {
+    pub fn at(line: u32) -> Self {
+        SourceBreakpoint {
+            line,
+            condition: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Breakpoint {
     /// The adapter could place it.
@@ -153,7 +169,7 @@ impl Session {
         adapter: &str,
         adapter_args: &[String],
         launch: &LaunchConfig,
-        breakpoints: &HashMap<String, Vec<u32>>,
+        breakpoints: &HashMap<String, Vec<SourceBreakpoint>>,
     ) -> Result<Session, DapError> {
         let (program, args) = adapter_command(adapter, adapter_args);
         let client = Client::spawn(&program, &args, launch.cwd.as_deref())?;
@@ -173,7 +189,7 @@ impl Session {
     fn handshake(
         &self,
         launch: &LaunchConfig,
-        breakpoints: &HashMap<String, Vec<u32>>,
+        breakpoints: &HashMap<String, Vec<SourceBreakpoint>>,
     ) -> Result<(), DapError> {
         self.client.request(
             "initialize",
@@ -261,13 +277,23 @@ impl Session {
             .map(|e| DebugEvent::from_event(&e))
     }
 
-    /// Replace the breakpoints of one file (`lines` are 1-based; empty clears the file).
-    pub fn set_breakpoints(&self, file: &str, lines: &[u32]) -> Result<Vec<Breakpoint>, DapError> {
+    /// Replace the breakpoints of one file (empty clears the file).
+    pub fn set_breakpoints(
+        &self,
+        file: &str,
+        bps: &[SourceBreakpoint],
+    ) -> Result<Vec<Breakpoint>, DapError> {
         let body = self.client.request(
             "setBreakpoints",
             json!({
                 "source": {"path": file},
-                "breakpoints": lines.iter().map(|l| json!({"line": l})).collect::<Vec<_>>(),
+                "breakpoints": bps
+                    .iter()
+                    .map(|b| match b.condition.as_deref().filter(|c| !c.trim().is_empty()) {
+                        Some(c) => json!({"line": b.line, "condition": c}),
+                        None => json!({"line": b.line}),
+                    })
+                    .collect::<Vec<_>>(),
             }),
         )?;
         Ok(body["breakpoints"]
@@ -354,13 +380,18 @@ impl Session {
             .unwrap_or_default())
     }
 
-    /// Evaluate an expression in a frame (watch / debug console).
-    pub fn evaluate(&self, expression: &str, frame_id: Option<i64>) -> Result<String, DapError> {
+    /// Evaluate an expression in a frame (a watch). The result may have children.
+    pub fn evaluate(&self, expression: &str, frame_id: Option<i64>) -> Result<Variable, DapError> {
         let body = self.client.request(
             "evaluate",
-            json!({"expression": expression, "frameId": frame_id, "context": "repl"}),
+            json!({"expression": expression, "frameId": frame_id, "context": "watch"}),
         )?;
-        Ok(body["result"].as_str().unwrap_or("").to_string())
+        Ok(Variable {
+            name: expression.to_string(),
+            value: body["result"].as_str().unwrap_or("").to_string(),
+            type_name: body["type"].as_str().map(str::to_string),
+            variables_reference: body["variablesReference"].as_i64().unwrap_or(0),
+        })
     }
 
     pub fn resume(&self, thread_id: i64) -> Result<(), DapError> {

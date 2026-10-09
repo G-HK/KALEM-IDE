@@ -13,6 +13,6 @@ mod session;
 
 pub use client::{encode, read_message, Client, DapError, Event};
 pub use session::{
-    adapter_command, Breakpoint, DebugEvent, LaunchConfig, Scope, Session, StackFrame, Thread,
-    Variable,
+    adapter_command, Breakpoint, DebugEvent, LaunchConfig, Scope, Session, SourceBreakpoint,
+    StackFrame, Thread, Variable,
 };

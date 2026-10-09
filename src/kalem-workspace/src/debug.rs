@@ -30,7 +30,11 @@ pub fn on_path(name: &str) -> bool {
     };
     std::env::split_paths(&paths).any(|dir| {
         let base = dir.join(name);
-        base.is_file() || (cfg!(windows) && base.with_extension("exe").is_file())
+        base.is_file()
+            || (cfg!(windows)
+                && ["exe", "cmd", "bat"]
+                    .iter()
+                    .any(|e| dir.join(format!("{name}.{e}")).is_file()))
     })
 }
 
