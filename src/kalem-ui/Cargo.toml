@@ -24,3 +24,7 @@ gpui-kit = { version = "0.7", features = [
   "tree-sitter-cpp", "tree-sitter-csharp", "tree-sitter-toml", "tree-sitter-markdown",
   "tree-sitter-yaml", "tree-sitter-bash", "tree-sitter-html", "tree-sitter-css",
 ] }
+
+# Windows only: puts the Kalem icon into kalem-ide.exe (Explorer, taskbar, Alt+Tab).
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
