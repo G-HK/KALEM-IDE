@@ -1,0 +1,21 @@
+[package]
+name = "kalem"
+description = "Kalem IDE command line entry point"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kalem-core = { path = "../kalem-core" }
+kalem-lang = { path = "../kalem-lang" }
+kalem-vcs = { path = "../kalem-vcs" }
+kalem-solution = { path = "../kalem-solution" }
+kalem-test = { path = "../kalem-test" }
+
+[lib]
+name = "kalem"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kalem"
+path = "src/main.rs"

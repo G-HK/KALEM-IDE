@@ -1,0 +1,9 @@
+[package]
+name = "kalem-test"
+description = "Kalem IDE test results: model, JUnit XML reader and overview summary"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+quick-xml = "0.38"

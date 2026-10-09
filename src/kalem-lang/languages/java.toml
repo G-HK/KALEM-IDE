@@ -1,0 +1,19 @@
+[language]
+id = "java"
+name = "Java"
+extensions = ["java"]
+grammar = "tree-sitter-java"
+
+[lsp]
+command = "jdtls"
+
+[debug]
+adapter = "java-debug"   # JDWP based
+
+[detect]
+project_files = ["build.gradle", "build.gradle.kts", "pom.xml"]
+
+[tasks]
+build = "./gradlew build"
+run = "./gradlew run"
+test = "./gradlew test"

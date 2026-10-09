@@ -1,0 +1,21 @@
+[language]
+id = "rust"
+name = "Rust"
+extensions = ["rs"]
+grammar = "tree-sitter-rust"
+
+[lsp]
+command = "rust-analyzer"
+
+[debug]
+adapter = "lldb-dap"
+[debug.linux]
+adapter = "lldb-dap"   # alternative: gdb --interpreter=dap
+
+[detect]
+project_files = ["Cargo.toml"]
+
+[tasks]
+build = "cargo build"
+run = "cargo run"
+test = "cargo test"

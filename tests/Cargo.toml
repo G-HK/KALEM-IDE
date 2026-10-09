@@ -1,0 +1,35 @@
+[package]
+name = "kalem-tests"
+description = "Integration and end-to-end tests for Kalem IDE"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+autotests = false
+
+[dev-dependencies]
+kalem = { path = "../src/kalem" }
+kalem-core = { path = "../src/kalem-core" }
+kalem-lang = { path = "../src/kalem-lang" }
+kalem-solution = { path = "../src/kalem-solution" }
+kalem-test = { path = "../src/kalem-test" }
+kalem-vcs = { path = "../src/kalem-vcs" }
+
+[lib]
+path = "lib.rs"
+
+[[test]]
+name = "cli"
+path = "cli.rs"
+[[test]]
+name = "junit"
+path = "junit.rs"
+[[test]]
+name = "explorer_vcs"
+path = "explorer_vcs.rs"
+[[test]]
+name = "languages"
+path = "languages.rs"
+[[test]]
+name = "solutions"
+path = "solutions.rs"

@@ -1,0 +1,17 @@
+[solution]
+name = "Veto"
+
+[[project]]
+path = "backend"
+language = "rust"
+
+[[project]]
+path = "services/api/Api.csproj"
+startup = true
+
+[[project]]
+path = "web/package.json"
+
+[[folder]]
+name = "Docs"
+items = ["docs/**", "README.md"]

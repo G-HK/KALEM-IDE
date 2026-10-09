@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/Solution Items/">
+    <File Path="README.md" />
+    <File Path="Directory.Build.props" />
+  </Folder>
+  <Folder Name="/Empty/" />
+  <Project Path="src/App/App.csproj" />
+  <Project Path="tests/App.Tests/App.Tests.csproj" />
+</Solution>

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.example.CalcTest" tests="2" failures="0" errors="0" skipped="0" time="0.12">
+  <properties><property name="java.version" value="21"/></properties>
+  <testcase name="adds" classname="com.example.CalcTest" time="0.05"/>
+  <testcase name="subtracts" classname="com.example.CalcTest" time="0.07"/>
+</testsuite>

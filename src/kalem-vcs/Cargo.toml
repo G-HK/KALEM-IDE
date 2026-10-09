@@ -1,0 +1,6 @@
+[package]
+name = "kalem-vcs"
+description = "Kalem IDE version control: VCS backends (Git first) and hosting-platform detection"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
