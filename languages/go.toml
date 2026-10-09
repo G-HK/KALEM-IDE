@@ -1,0 +1,19 @@
+[language]
+id = "go"
+name = "Go"
+extensions = ["go"]
+grammar = "tree-sitter-go"
+
+[lsp]
+command = "gopls"
+
+[debug]
+adapter = "dlv"        # delve in DAP mode (dlv dap); macOS needs developer-tools permission
+
+[detect]
+project_files = ["go.mod"]
+
+[tasks]
+build = "go build ./..."
+run = "go run ."
+test = "go test ./..."

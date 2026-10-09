@@ -1,0 +1,19 @@
+[language]
+id = "csharp"
+name = "C# / .NET"
+extensions = ["cs", "csx"]
+grammar = "tree-sitter-c-sharp"
+
+[lsp]
+command = "roslyn-language-server"   # Roslyn (MIT)
+
+[debug]
+adapter = "netcoredbg"
+
+[detect]
+project_files = ["*.sln", "*.csproj"]
+
+[tasks]
+build = "dotnet build"
+run = "dotnet run"
+test = "dotnet test"

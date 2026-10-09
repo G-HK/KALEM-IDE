@@ -1,0 +1,19 @@
+[language]
+id = "kotlin"
+name = "Kotlin (JVM)"
+extensions = ["kt", "kts"]
+grammar = "tree-sitter-kotlin"
+
+[lsp]
+command = "kotlin-lsp"   # verify current server + license (JetBrains kotlin-lsp or fwcd/kotlin-language-server)
+
+[debug]
+adapter = "kotlin-debug-adapter"   # JDWP based; java-debug is the fallback
+
+[detect]
+project_files = ["build.gradle.kts", "build.gradle", "pom.xml"]
+
+[tasks]
+build = "./gradlew build"
+run = "./gradlew run"
+test = "./gradlew test"
