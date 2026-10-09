@@ -1,0 +1,15 @@
+[package]
+name = "kalem-spike-egui"
+description = "UI spike: egui + egui_dock"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+kalem-spike-data = { path = "../common" }
+kalem-core = { path = "../../src/kalem-core" }
+kalem-vcs = { path = "../../src/kalem-vcs" }
+kalem-test = { path = "../../src/kalem-test" }
+eframe = "0.36"
+egui_dock = "0.21"

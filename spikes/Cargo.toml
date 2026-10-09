@@ -1,0 +1,10 @@
+# Separate workspace: UI toolkit comparison (see docs/TECH_STACK.md). Not part of the main build.
+[workspace]
+resolver = "2"
+members = ["common", "ui-egui", "ui-gpui"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false

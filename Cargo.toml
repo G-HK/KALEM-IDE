@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = ["src/kalem", "src/kalem-*", "tests"]
+# Throw-away UI experiments with heavy dependencies: kept out of the main build and CI.
+exclude = ["spikes"]
 
 [workspace.package]
 version = "0.0.1"
