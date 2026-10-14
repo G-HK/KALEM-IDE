@@ -29,7 +29,8 @@ export DISPLAY=:99
 export XDG_RUNTIME_DIR=/tmp/xdg-runtime
 mkdir -p -m 700 "$XDG_RUNTIME_DIR"
 # Software Vulkan: the container has no GPU.
-VK_ICD_FILENAMES="$(ls /usr/share/vulkan/icd.d/lvp_icd.*.json | head -n1)"
+# (lvp_icd.json on Ubuntu 26.04+, lvp_icd.<arch>.json before).
+VK_ICD_FILENAMES="$(ls /usr/share/vulkan/icd.d/lvp_icd*.json | head -n1)"
 export VK_ICD_FILENAMES
 sleep 1
 

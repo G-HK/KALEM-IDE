@@ -20,9 +20,10 @@ description: |-
   Language packs for C/C++, Rust, C#, Python, TypeScript, Go, Java and Kotlin;
   Git and hosting platforms; test and debug overviews.
 
-# kalem links glibc and libgcc_s. kalem-ide also links xcb and xkbcommon (ldd), and loads Vulkan and
-# Wayland at run time (dlopen, invisible to ldd), so those are listed by hand. A Vulkan driver comes
-# with the desktop's Mesa or GPU driver; mesa-vulkan-drivers adds the software fallback.
+# kalem links glibc and libgcc_s. kalem-ide also links xcb, xkbcommon and (on some builds, e.g.
+# aarch64) fontconfig (ldd), and loads Vulkan and Wayland at run time (dlopen, invisible to ldd), so
+# those are listed by hand. A Vulkan driver comes with the desktop's Mesa or GPU driver;
+# mesa-vulkan-drivers adds the software fallback.
 overrides:
   deb:
     depends:
@@ -34,6 +35,7 @@ overrides:
       - libvulkan1
       - libwayland-client0
       - libwayland-cursor0
+      - libfontconfig1
     recommends:
       - git
       - mesa-vulkan-drivers
@@ -48,6 +50,7 @@ overrides:
       - vulkan-loader
       - libwayland-client
       - libwayland-cursor
+      - fontconfig
     recommends:
       - git
       - mesa-vulkan-drivers

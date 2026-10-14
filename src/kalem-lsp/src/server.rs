@@ -42,7 +42,8 @@ impl Server {
         let client = Client::spawn(command, args, Some(root))?;
         match Server::handshake(client, root) {
             Ok(s) => Ok(s),
-            Err((e, client)) => {
+            Err(failed) => {
+                let (e, client) = *failed;
                 client.kill();
                 Err(e)
             }
@@ -51,10 +52,11 @@ impl Server {
 
     /// The handshake over an existing connection (tests use an in-process server).
     pub fn connect(client: Client, root: &Path) -> Result<Server, LspError> {
-        Server::handshake(client, root).map_err(|(e, _)| e)
+        Server::handshake(client, root).map_err(|failed| failed.0)
     }
 
-    fn handshake(client: Client, root: &Path) -> Result<Server, (LspError, Client)> {
+    /// On failure the client comes back too, so `start` can kill the process (boxed: it is large).
+    fn handshake(client: Client, root: &Path) -> Result<Server, Box<(LspError, Client)>> {
         let root_uri = path_to_uri(root);
         let name = root
             .file_name()
@@ -95,10 +97,10 @@ impl Server {
         );
         let init = match init {
             Ok(v) => v,
-            Err(e) => return Err((e, client)),
+            Err(e) => return Err(Box::new((e, client))),
         };
         if let Err(e) = client.notify("initialized", json!({})) {
-            return Err((e, client));
+            return Err(Box::new((e, client)));
         }
         Ok(Server {
             client,

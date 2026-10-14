@@ -56,8 +56,9 @@ The IDE starts without them; features that need one tell you in the Output panel
   console you started it from.
 - On Windows, release builds have no console, so the traces only show with a debug build
   (`cargo run -p kalem-ui`).
-- Blank or black window on Linux without a GPU: `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json`
-  (`lvp_icd.aarch64.json` on ARM; package `mesa-vulkan-drivers`) selects the software renderer.
+- Blank or black window on Linux without a GPU: `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json`
+  (`lvp_icd.x86_64.json` / `lvp_icd.aarch64.json` before Ubuntu 26.04; package `mesa-vulkan-drivers`)
+  selects the software renderer.
 - `STATUS_STACK_OVERFLOW` (0xc00000fd) at start on Windows: debug builds need more than Windows'
   default 1 MB main-thread stack. The build asks the linker for 16 MB (`src/kalem-ui/build.rs`); if you
   still see it, run `cargo clean -p kalem-ui` once, or use `--release`.
