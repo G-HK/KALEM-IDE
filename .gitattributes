@@ -71,3 +71,5 @@
 *.toml text eol=lf
 *.yml text eol=lf
 *.png binary
+Dockerfile text eol=lf
+*.desktop text eol=lf

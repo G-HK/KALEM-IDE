@@ -12,3 +12,12 @@
 9. Extension API (WASM) and MCP server.
 
 First vertical slice: Rust, C#, TypeScript and Kotlin on one platform, with the others tested in CI from day one.
+
+## Known platform issues
+
+- **Linux, X11 without a compositor and without a GPU (software Vulkan):** the window opens but stays
+  blank. GPUI always draws into a 32-bit transparent window when the X server offers one, and Mesa's
+  software renderer shows nothing in it unless a compositor runs. Desktops with a compositor (GNOME,
+  KDE, most others) or a GPU driver are not affected. Workaround: start a compositor (e.g. `picom`).
+  The Docker check (`deployments/linux/check.sh`) avoids it by starting Xvfb without Composite.
+  Fix belongs in GPUI (fall back to an opaque visual when no compositor is running).
