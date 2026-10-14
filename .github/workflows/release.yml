@@ -81,10 +81,19 @@ jobs:
       - name: Check the packages
         run: |
           dpkg-deb --info dist/release/*.deb
-          dpkg-deb --contents dist/release/*.deb | grep -E 'usr/bin/kalem$|share/kalem/languages/rust.toml'
-          ldd target/release/kalem
-          dpkg-deb -x dist/release/*.deb "$RUNNER_TEMP/inst"
-          "$RUNNER_TEMP/inst/usr/bin/kalem" languages.list
+          contents="$(dpkg-deb --contents dist/release/*.deb)"
+          for f in 'usr/bin/kalem$' 'usr/bin/kalem-ide$' 'share/kalem/languages/rust.toml' \
+                   'share/applications/kalem-ide.desktop' 'hicolor/512x512/apps/kalem-ide.png'; do
+            grep -Eq "$f" <<<"$contents" || { echo "::error::deb is missing $f"; exit 1; }
+          done
+          sudo apt-get update -qq
+          sudo apt-get install -y desktop-file-utils
+          desktop-file-validate deployments/linux/kalem-ide.desktop
+          # A real install pulls the declared dependencies; nothing may be missing afterwards.
+          sudo apt-get install -y ./dist/release/*.deb
+          if ldd /usr/bin/kalem-ide | grep 'not found'; then echo "::error::kalem-ide has missing libraries"; exit 1; fi
+          kalem languages.list
+          sudo apt-get remove -y kalem-ide
       - uses: actions/upload-artifact@v4
         with:
           name: release-linux-${{ matrix.arch }}
@@ -183,16 +192,24 @@ jobs:
           Expand-Archive dist/release/*-portable.zip -DestinationPath $env:RUNNER_TEMP/portable
           & (Get-ChildItem $env:RUNNER_TEMP/portable -Recurse -Filter kalem.exe).FullName languages.list
           if ($LASTEXITCODE -ne 0) { throw 'portable kalem.exe failed' }
-          # Silent install, run from the install folder, check PATH, silent uninstall.
+          if (-not (Get-ChildItem $env:RUNNER_TEMP/portable -Recurse -Filter kalem-ide.exe)) { throw 'portable zip has no kalem-ide.exe' }
           $setup = (Get-ChildItem dist/release -Filter *-setup.exe).FullName
-          Start-Process $setup -ArgumentList '/S' -Wait
           $dir = "$env:ProgramFiles\Kalem IDE"
+          $menu = "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Kalem IDE.lnk"
+          $desk = "$env:PUBLIC\Desktop\Kalem IDE.lnk"
+          # Silent install without a desktop shortcut first ...
+          Start-Process $setup -ArgumentList '/S', '/NODESKTOP' -Wait
+          if (Test-Path $desk) { throw '/NODESKTOP still created a desktop shortcut' }
+          # ... then install again over it (an upgrade), with the default desktop shortcut.
+          Start-Process $setup -ArgumentList '/S' -Wait
           & "$dir\kalem.exe" languages.list
           if ($LASTEXITCODE -ne 0) { throw 'installed kalem.exe failed' }
+          foreach ($p in @("$dir\kalem-ide.exe", $menu, $desk)) { if (-not (Test-Path $p)) { throw "missing after install: $p" } }
           $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
           if (($machinePath -split ';') -notcontains $dir) { throw 'install folder is not on PATH' }
           Start-Process "$dir\uninstall.exe" -ArgumentList '/S', "_?=$dir" -Wait
-          if (Test-Path "$dir\kalem.exe") { throw 'uninstall left kalem.exe behind' }
+          foreach ($p in @("$dir\kalem.exe", "$dir\kalem-ide.exe", $menu, $desk)) { if (Test-Path $p) { throw "uninstall left $p behind" } }
+          if (Test-Path 'HKLM:\Software\Microsoft\Windows\CurrentVersion\App Paths\kalem-ide.exe') { throw 'uninstall left the App Paths key' }
       - uses: actions/upload-artifact@v4
         with:
           name: release-windows-${{ matrix.arch }}

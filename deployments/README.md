@@ -8,7 +8,8 @@ deployments/
 ├── set_version.py         set the workspace version (release workflow)
 ├── windows/               package.ps1, sign.ps1, kalem.nsi   -> setup .exe (NSIS) + portable .zip (x64, arm64)
 ├── macos/                 package.sh, import-cert.sh, entitlements.plist -> .pkg + .tar.gz (universal)
-└── linux/                 package.sh, nfpm.yaml              -> .deb + .rpm + .tar.gz (x86_64, aarch64)
+└── linux/                 package.sh, nfpm.yaml, kalem-ide.desktop -> .deb + .rpm + .tar.gz (x86_64, aarch64)
+                           Dockerfile, check.sh               -> Linux check of the IDE (docs/RUNNING.md)
 ```
 
 Artifacts land in `dist/release/` (gitignored), each with a `.sha256`:
@@ -19,9 +20,9 @@ Artifacts land in `dist/release/` (gitignored), each with a `.sha256`:
 | macOS | `kalem-ide-<v>-macos-universal.pkg`, `.tar.gz` |
 | Linux | `kalem-ide-<v>-linux-{x86_64,aarch64}.deb`, `.rpm`, `.tar.gz` |
 
-Windows setup: a wizard with an **Add Kalem to PATH** page (ticked by default; the uninstaller removes the entry). Silent: `setup.exe /S`, add `/NOPATH` to skip the PATH change.
+Windows setup: a wizard with an options page: **Add Kalem to PATH** and **Create a desktop shortcut** (both ticked by default; the uninstaller removes them). Silent: `setup.exe /S`, add `/NOPATH` to skip the PATH change and `/NODESKTOP` to skip the desktop shortcut.
 
-Installed layout: `<prefix>/bin/kalem` with the language packs in `<prefix>/share/kalem/languages` (Windows: `languages\` beside `kalem.exe`). Kalem finds them relative to the executable, or via `KALEM_LANGUAGES`.
+Installed layout: `<prefix>/bin/kalem` (CLI) and `<prefix>/bin/kalem-ide` (the IDE; Linux also gets `share/applications/kalem-ide.desktop` and an icon) with the language packs in `<prefix>/share/kalem/languages` (Windows: `kalem.exe`, `kalem-ide.exe` and `languages\` in one folder, plus a Start-menu shortcut). macOS packages contain the CLI only. Kalem finds the language packs relative to the executable, or via `KALEM_LANGUAGES`.
 
 ## Run locally
 

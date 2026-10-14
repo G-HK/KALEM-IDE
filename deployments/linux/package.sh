@@ -9,7 +9,7 @@
 # Usage: deployments/linux/package.sh [--skip-build] [--formats "tar deb rpm"]
 #
 # deb/rpm need nfpm (https://nfpm.goreleaser.com); they are skipped with a warning if it is
-# missing. Build on an old distro (CI: Ubuntu 22.04, glibc 2.35) so the binary runs on newer ones.
+# missing. Build on an old distro (CI: Ubuntu 22.04, glibc 2.35) so the binaries run on newer ones.
 set -euo pipefail
 # shellcheck source=../env.sh
 . "$(dirname "${BASH_SOURCE[0]}")/../env.sh"
@@ -36,19 +36,25 @@ BASENAME="kalem-ide-$VERSION-linux-$ARCH"
 echo "==> Kalem IDE $VERSION for Linux $ARCH ($FORMATS)"
 
 if [ "$SKIP_BUILD" = 0 ]; then
-  (cd "$ROOT" && cargo build --release --locked -p kalem)
+  (cd "$ROOT" && cargo build --release --locked -p kalem -p kalem-ui)
 fi
 BIN="$CARGO_TARGET_DIR/release/kalem"
-[ -f "$BIN" ] || { echo "missing $BIN - build first" >&2; exit 1; }
+IDE="$CARGO_TARGET_DIR/release/kalem-ide"
+for f in "$BIN" "$IDE"; do
+  [ -f "$f" ] || { echo "missing $f - build first" >&2; exit 1; }
+done
 
 WORK="$CARGO_TARGET_DIR/linux-package"
 STAGE="$WORK/root"
 rm -rf "$WORK"
 install -Dm755 "$BIN" "$STAGE/usr/bin/kalem"
+install -Dm755 "$IDE" "$STAGE/usr/bin/kalem-ide"
+install -Dm644 "$HERE/kalem-ide.desktop" "$STAGE/usr/share/applications/kalem-ide.desktop"
+install -Dm644 "$ROOT/src/kalem-ui/assets/kalem-ide.png" "$STAGE/usr/share/icons/hicolor/512x512/apps/kalem-ide.png"
 mkdir -p "$STAGE/usr/share/kalem/languages" "$STAGE/usr/share/doc/kalem-ide"
 cp "$LANG_SRC"/*.toml "$STAGE/usr/share/kalem/languages/"
 cp "$ROOT/README.md" "$ROOT/LICENSE-MIT" "$ROOT/LICENSE-APACHE" "$STAGE/usr/share/doc/kalem-ide/"
-strip "$STAGE/usr/bin/kalem" 2>/dev/null || true
+strip "$STAGE/usr/bin/kalem" "$STAGE/usr/bin/kalem-ide" 2>/dev/null || true
 
 for fmt in $FORMATS; do
   case "$fmt" in

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Kalem IDE
+Comment=Multi-language IDE
+Exec=kalem-ide %F
+Icon=kalem-ide
+Terminal=false
+Categories=Development;IDE;
+StartupWMClass=kalem-ide

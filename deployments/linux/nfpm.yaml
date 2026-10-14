@@ -20,25 +20,44 @@ description: |-
   Language packs for C/C++, Rust, C#, Python, TypeScript, Go, Java and Kotlin;
   Git and hosting platforms; test and debug overviews.
 
-# The binary links only glibc and libgcc_s directly.
+# kalem links glibc and libgcc_s. kalem-ide also links xcb and xkbcommon (ldd), and loads Vulkan and
+# Wayland at run time (dlopen, invisible to ldd), so those are listed by hand. A Vulkan driver comes
+# with the desktop's Mesa or GPU driver; mesa-vulkan-drivers adds the software fallback.
 overrides:
   deb:
     depends:
       - libc6 (>= 2.35)
       - libgcc-s1
+      - libxcb1
+      - libxkbcommon0
+      - libxkbcommon-x11-0
+      - libvulkan1
+      - libwayland-client0
+      - libwayland-cursor0
     recommends:
       - git
+      - mesa-vulkan-drivers
   rpm:
     depends:
       # Same floor as the deb: built on glibc 2.35, so older systems must refuse the install
       # instead of installing a binary that cannot start.
       - glibc >= 2.35
+      - libxcb
+      - libxkbcommon
+      - libxkbcommon-x11
+      - vulkan-loader
+      - libwayland-client
+      - libwayland-cursor
     recommends:
       - git
+      - mesa-vulkan-drivers
 
 contents:
   - src: ${STAGE}/usr/bin/kalem
     dst: /usr/bin/kalem
+    file_info: { mode: 0755 }
+  - src: ${STAGE}/usr/bin/kalem-ide
+    dst: /usr/bin/kalem-ide
     file_info: { mode: 0755 }
   - src: ${STAGE}/usr/share/
     dst: /usr/share/
