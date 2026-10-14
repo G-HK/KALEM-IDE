@@ -1,8 +1,12 @@
 name: CI
 
-# Manual only: Actions tab -> CI -> Run workflow.
 on:
+  push:
+  pull_request:
   workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
   check:
@@ -16,6 +20,26 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+      # The desktop app on Windows. Linux runs it in the Docker job below; macOS is not covered yet.
+      - if: runner.os == 'Windows'
+        run: cargo clippy -p kalem-ui --all-targets -- -D warnings
+      - if: runner.os == 'Windows'
+        run: cargo build -p kalem-ui
+
+  # The desktop app on Linux: same check as `docker run ... kalem-linux-check` locally.
+  linux-gui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t kalem-linux-check deployments/linux
+      - run: docker run --rm -v "$PWD:/src" kalem-linux-check
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: linux-check
+          path: dist/linux-check/
+          if-no-files-found: ignore

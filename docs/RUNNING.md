@@ -54,12 +54,26 @@ The IDE starts without them; features that need one tell you in the Output panel
   (macOS) or `~/.config/kalem` (Linux). Set `KALEM_CONFIG_DIR` to use another folder (a clean start).
 - `KALEM_LSP_TRACE=1` and `KALEM_DAP_TRACE=1` print every language-server / debug-adapter message to the
   console you started it from.
-- Blank or black window on Linux without a GPU: `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json`
-  selects the software renderer.
+- On Windows, release builds have no console, so the traces only show with a debug build
+  (`cargo run -p kalem-ui`).
+- Blank or black window on Linux without a GPU: `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json`
+  (`lvp_icd.aarch64.json` on ARM; package `mesa-vulkan-drivers`) selects the software renderer.
 - `STATUS_STACK_OVERFLOW` (0xc00000fd) at start on Windows: debug builds need more than Windows'
   default 1 MB main-thread stack. The build asks the linker for 16 MB (`src/kalem-ui/build.rs`); if you
   still see it, run `cargo clean -p kalem-ui` once, or use `--release`.
 - Build errors about a missing linker or `link.exe` on Windows: the C++ Build Tools workload is missing.
+
+## Linux check in Docker
+
+Builds the desktop app on the latest Ubuntu, runs clippy and the tests, and starts the IDE on a
+virtual screen with software rendering. Docker Desktop must be running.
+
+    docker build -t kalem-linux-check deployments/linux
+    docker run --rm -v "${PWD}:/src" -v kalem-target:/src/target -v kalem-cargo:/usr/local/cargo/registry kalem-linux-check
+
+It ends with `OK: dist/linux-check/kalem-ide.png`; open the screenshot to see the IDE. The first run
+takes a while (GPUI); the two volumes keep the build for the next run. If Docker runs out of memory
+during the build, add `-e CARGO_BUILD_JOBS=4`. CI runs the same check.
 
 ## Checks before pushing
 
@@ -70,4 +84,6 @@ cargo clippy -p kalem-ui --all-targets -- -D warnings
 cargo test
 ```
 
-These are what CI runs (`.github/workflows/ci.yml`, started manually from the Actions tab).
+CI (`.github/workflows/ci.yml`) runs these on every push and pull request on Linux, macOS and Windows,
+builds the desktop app on Windows, and runs the Docker Linux check (screenshot in the `linux-check`
+artifact).
