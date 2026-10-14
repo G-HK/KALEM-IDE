@@ -16,6 +16,10 @@ use gpui_kit::component::Root;
 use gpui_kit::*;
 use std::path::PathBuf;
 
+/// Linux WM_CLASS / Wayland app id of every Kalem window. Must match the `.desktop` file name and its
+/// `StartupWMClass` (deployments/linux/kalem-ide.desktop) so the dock groups windows under Kalem.
+pub const APP_ID: &str = "kalem-ide";
+
 fn main() {
     // `kalem-ide [folder | solution file]`
     let start: Option<PathBuf> = std::env::args_os().nth(1).map(PathBuf::from);
@@ -30,6 +34,7 @@ fn main() {
                     title: Some("Kalem IDE".into()),
                     ..Default::default()
                 }),
+                app_id: Some(APP_ID.into()),
                 ..Default::default()
             };
             gpui_kit::open_window(options, cx, |window, cx| {

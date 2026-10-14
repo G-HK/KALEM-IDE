@@ -76,6 +76,11 @@ jobs:
           sudo dpkg -i "$RUNNER_TEMP/nfpm.deb"
       - name: Apply version
         run: python3 deployments/set_version.py "$KALEM_VERSION"
+      - name: Install the desktop app's build libraries
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libx11-dev libx11-xcb-dev libxcb1-dev libxkbcommon-dev \
+            libxkbcommon-x11-dev libwayland-dev libfontconfig1-dev libfreetype-dev libvulkan-dev
       - name: Build and package (deb, rpm, tar.gz)
         run: bash deployments/linux/package.sh
       - name: Check the packages
@@ -86,14 +91,15 @@ jobs:
                    'share/applications/kalem-ide.desktop' 'hicolor/512x512/apps/kalem-ide.png'; do
             grep -Eq "$f" <<<"$contents" || { echo "::error::deb is missing $f"; exit 1; }
           done
-          sudo apt-get update -qq
           sudo apt-get install -y desktop-file-utils
           desktop-file-validate deployments/linux/kalem-ide.desktop
-          # A real install pulls the declared dependencies; nothing may be missing afterwards.
-          sudo apt-get install -y ./dist/release/*.deb
-          if ldd /usr/bin/kalem-ide | grep 'not found'; then echo "::error::kalem-ide has missing libraries"; exit 1; fi
-          kalem languages.list
-          sudo apt-get remove -y kalem-ide
+          # Install into a clean Ubuntu 22.04 (the runner has the -dev libraries from the build): apt
+          # must pull every declared dependency, and nothing may be missing afterwards.
+          docker run --rm -v "$PWD/dist/release:/pkg:ro" ubuntu:22.04 bash -euo pipefail -c '
+            apt-get update -qq
+            apt-get install -y --no-install-recommends /pkg/*.deb
+            if ldd /usr/bin/kalem-ide | grep "not found"; then echo "::error::kalem-ide has missing libraries"; exit 1; fi
+            kalem languages.list'
       - uses: actions/upload-artifact@v4
         with:
           name: release-linux-${{ matrix.arch }}

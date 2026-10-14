@@ -2267,6 +2267,7 @@ impl Kalem {
                 title: Some("Kalem IDE".into()),
                 ..Default::default()
             }),
+            app_id: Some(crate::APP_ID.into()),
             window_bounds: at.map(|p| {
                 WindowBounds::Windowed(Bounds::new(
                     point(p.x - px(80.), p.y - px(12.)),

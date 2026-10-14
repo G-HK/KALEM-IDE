@@ -9,7 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl git build-essential pkg-config \
       libx11-dev libx11-xcb-dev libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
       libfontconfig1-dev libfreetype-dev libvulkan-dev libssl-dev \
-      xvfb mesa-vulkan-drivers imagemagick \
+      xvfb mesa-vulkan-drivers imagemagick x11-utils \
     && rm -rf /var/lib/apt/lists/*
 ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo PATH=/usr/local/cargo/bin:$PATH
 RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --component clippy,rustfmt

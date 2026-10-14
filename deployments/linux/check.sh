@@ -51,6 +51,12 @@ kill "$APP"; wait "$APP" 2>/dev/null || true
 
 start 10 "$PWD"
 import -window root "$OUT/kalem-ide.png"
+# The dock ties the window to kalem-ide.desktop through WM_CLASS (main.rs APP_ID).
+win="$(xwininfo -root -tree | awk '/"Kalem IDE"/{print $1; exit}')"
+if ! xprop -id "$win" WM_CLASS | grep -q '"kalem-ide"'; then
+  echo "window WM_CLASS is not kalem-ide: $(xprop -id "$win" WM_CLASS)" >&2
+  exit 1
+fi
 kill "$APP"; wait "$APP" 2>/dev/null || true
 
 colours="$(identify -format %k "$OUT/kalem-ide.png")"
