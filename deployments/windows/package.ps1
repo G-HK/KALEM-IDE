@@ -4,8 +4,8 @@
 
 .DESCRIPTION
   Produces, in $env:DIST (default: dist/release):
-    kalem-ide-<version>-windows-<arch>-setup.exe      installer (NSIS), optionally adds kalem to PATH
-    kalem-ide-<version>-windows-<arch>-portable.zip   kalem.exe + languages\ (unzip and run)
+    kalem-ide-<version>-windows-<arch>-setup.exe      installer (NSIS): IDE + CLI, Start-menu shortcut, optionally PATH and a desktop shortcut
+    kalem-ide-<version>-windows-<arch>-portable.zip   kalem.exe, kalem-ide.exe + languages\ (unzip and run)
     plus a .sha256 beside each
 
   The binary links the C runtime statically (+crt-static), so neither package needs the Visual
@@ -58,27 +58,27 @@ if (-not $SkipBuild) {
   # proc-macros are unaffected.
   $flagVar = 'CARGO_TARGET_' + ($Target.ToUpper() -replace '-', '_') + '_RUSTFLAGS'
   [Environment]::SetEnvironmentVariable($flagVar, '-C target-feature=+crt-static')
-  Invoke-Native "cargo build ($Target)" { cargo build --release --locked -p kalem --target $Target }
+  Invoke-Native "cargo build ($Target)" { cargo build --release --locked -p kalem -p kalem-ui --target $Target }
 }
 
 $Bin = Join-Path $TargetDir "$Target\release"
-$Exe = Join-Path $Bin 'kalem.exe'
-if (-not (Test-Path $Exe)) { throw "missing $Exe - build first" }
-
-# Check the PE header: Machine must match -Arch, so an x64 build can never ship labelled arm64.
-$bytes = [System.IO.File]::ReadAllBytes($Exe)
-$pe = [BitConverter]::ToInt32($bytes, 0x3C)
-$machine = [BitConverter]::ToUInt16($bytes, $pe + 4)
+$Exes = @('kalem.exe', 'kalem-ide.exe') | ForEach-Object { Join-Path $Bin $_ }
 $expected = switch ($Arch) { 'x64' { 0x8664 } 'arm64' { 0xAA64 } }
-if ($machine -ne $expected) { throw ("kalem.exe machine type 0x{0:X} does not match -Arch {1}" -f $machine, $Arch) }
-
-& (Join-Path $PSScriptRoot 'sign.ps1') $Exe
+foreach ($Exe in $Exes) {
+  if (-not (Test-Path $Exe)) { throw "missing $Exe - build first" }
+  # Check the PE header: Machine must match -Arch, so an x64 build can never ship labelled arm64.
+  $bytes = [System.IO.File]::ReadAllBytes($Exe)
+  $pe = [BitConverter]::ToInt32($bytes, 0x3C)
+  $machine = [BitConverter]::ToUInt16($bytes, $pe + 4)
+  if ($machine -ne $expected) { throw ("{0} machine type 0x{1:X} does not match -Arch {2}" -f (Split-Path $Exe -Leaf), $machine, $Arch) }
+  & (Join-Path $PSScriptRoot 'sign.ps1') $Exe
+}
 
 # ---- portable zip ------------------------------------------------------------------------------
 $Stage = Join-Path $TargetDir "windows-package\$Name"
 Remove-Item -Recurse -Force (Split-Path $Stage) -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $Stage | Out-Null
-Copy-Item $Exe $Stage
+Copy-Item $Exes $Stage
 Copy-Item -Recurse $LangDir (Join-Path $Stage 'languages')
 Copy-Item (Join-Path $Root 'README.md'), (Join-Path $Root 'LICENSE-MIT'), (Join-Path $Root 'LICENSE-APACHE') $Stage
 $Zip = Join-Path $Dist "$Name-portable.zip"

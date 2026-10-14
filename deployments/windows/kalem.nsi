@@ -2,10 +2,11 @@
 ;
 ;   makensis /DVERSION=0.1.0 /DNUMVERSION=0.1.0 /DARCH=x64 /DBINDIR=... /DLANGDIR=... /DROOTDIR=... /DOUTFILE=... kalem.nsi
 ;
-; Per-machine install into Program Files, `languages\` beside the exe, an optional "add to PATH"
-; "Add to PATH" page (ticked by default) and a normal uninstaller.
-; Silent install: setup.exe /S   (add /NOPATH to skip the PATH change, /D=C:\dir last to change
-; the folder). Silent uninstall: "%ProgramFiles%\Kalem IDE\uninstall.exe" /S
+; Per-machine install into Program Files: the IDE (kalem-ide.exe) and the CLI (kalem.exe), `languages\`
+; beside them, a Start-menu shortcut, an options page ("Add to PATH" and "desktop shortcut", both
+; ticked by default) and a normal uninstaller.
+; Silent install: setup.exe /S   (/NOPATH skips the PATH change, /NODESKTOP the desktop shortcut,
+; /D=C:\dir last to change the folder). Silent uninstall: "%ProgramFiles%\Kalem IDE\uninstall.exe" /S
 
 Unicode true
 !ifndef VERSION
@@ -48,6 +49,8 @@ VIAddVersionKey "LegalCopyright" "MIT OR Apache-2.0"
 
 Var AddPath
 Var PathCheckbox
+Var AddDesktop
+Var DesktopCheckbox
 
 !define MUI_ABORTWARNING
 !insertmacro MUI_PAGE_WELCOME
@@ -70,6 +73,12 @@ Function .onInit
   ${IfNot} ${Errors}
     StrCpy $AddPath 0
   ${EndIf}
+  StrCpy $AddDesktop 1
+  ClearErrors
+  ${GetOptions} $R0 "/NODESKTOP" $R1
+  ${IfNot} ${Errors}
+    StrCpy $AddDesktop 0
+  ${EndIf}
 FunctionEnd
 
 Function PathPageCreate
@@ -86,11 +95,17 @@ Function PathPageCreate
   ${If} $AddPath == 1
     ${NSD_Check} $PathCheckbox
   ${EndIf}
+  ${NSD_CreateCheckbox} 0 72u 100% 12u "Create a desktop shortcut"
+  Pop $DesktopCheckbox
+  ${If} $AddDesktop == 1
+    ${NSD_Check} $DesktopCheckbox
+  ${EndIf}
   nsDialogs::Show
 FunctionEnd
 
 Function PathPageLeave
   ${NSD_GetState} $PathCheckbox $AddPath
+  ${NSD_GetState} $DesktopCheckbox $AddDesktop
 FunctionEnd
 
 Function un.onInit
@@ -101,6 +116,7 @@ Section "Kalem IDE (required)" SecMain
   SectionIn RO
   SetOutPath "$INSTDIR"
   File "${BINDIR}\kalem.exe"
+  File "${BINDIR}\kalem-ide.exe"
   File "${ROOTDIR}\LICENSE-MIT"
   File "${ROOTDIR}\LICENSE-APACHE"
   File "${ROOTDIR}\README.md"
@@ -110,9 +126,17 @@ Section "Kalem IDE (required)" SecMain
   WriteUninstaller "$INSTDIR\uninstall.exe"
   WriteRegStr HKLM "Software\Kalem IDE" "InstallDir" "$INSTDIR"
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\App Paths\kalem.exe" "" "$INSTDIR\kalem.exe"
+  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\App Paths\kalem-ide.exe" "" "$INSTDIR\kalem-ide.exe"
+  ; Shortcuts for all users, matching the per-machine install.
+  SetShellVarContext all
+  CreateShortcut "$SMPROGRAMS\Kalem IDE.lnk" "$INSTDIR\kalem-ide.exe"
+  ${If} $AddDesktop == 1
+    CreateShortcut "$DESKTOP\Kalem IDE.lnk" "$INSTDIR\kalem-ide.exe"
+  ${EndIf}
 
   WriteRegStr HKLM "${UNINSTKEY}" "DisplayName" "Kalem IDE"
   WriteRegStr HKLM "${UNINSTKEY}" "DisplayVersion" "${VERSION}"
+  WriteRegStr HKLM "${UNINSTKEY}" "DisplayIcon" "$INSTDIR\kalem-ide.exe"
   WriteRegStr HKLM "${UNINSTKEY}" "Publisher" "Kalem IDE contributors"
   WriteRegStr HKLM "${UNINSTKEY}" "InstallLocation" "$INSTDIR"
   WriteRegStr HKLM "${UNINSTKEY}" "UninstallString" '"$INSTDIR\uninstall.exe"'
@@ -148,6 +172,10 @@ Section "Uninstall"
   Pop $0
   SendMessage ${HWND_BROADCAST} ${WM_WININICHANGE} 0 "STR:Environment" /TIMEOUT=5000
 
+  SetShellVarContext all
+  Delete "$SMPROGRAMS\Kalem IDE.lnk"
+  Delete "$DESKTOP\Kalem IDE.lnk"
+  Delete "$INSTDIR\kalem-ide.exe"
   Delete "$INSTDIR\kalem.exe"
   Delete "$INSTDIR\LICENSE-MIT"
   Delete "$INSTDIR\LICENSE-APACHE"
@@ -159,5 +187,6 @@ Section "Uninstall"
 
   DeleteRegKey HKLM "${UNINSTKEY}"
   DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\App Paths\kalem.exe"
+  DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\App Paths\kalem-ide.exe"
   DeleteRegKey HKLM "Software\Kalem IDE"
 SectionEnd
