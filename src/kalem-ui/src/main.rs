@@ -1,4 +1,7 @@
 //! Kalem IDE desktop app. All behaviour that is not drawing lives in `kalem-workspace`.
+// Release builds are a GUI app on Windows: no console window behind the IDE. Debug builds keep it
+// for KALEM_LSP_TRACE / KALEM_DAP_TRACE output.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
 mod assets;
