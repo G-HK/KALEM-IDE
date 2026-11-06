@@ -310,7 +310,7 @@ impl Kalem {
                 },
             );
             self.output.push(format!(
-                "{}: the language server `{}` is not installed. Install it (see docs/LANGUAGES.md) for completion, hover and diagnostics.",
+                "{}: the language server `{}` is not installed. Install it (see docs/LSP.md) for completion, hover and diagnostics.",
                 spec.language, spec.command
             ));
             cx.notify();

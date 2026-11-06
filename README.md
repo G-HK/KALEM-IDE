@@ -5,9 +5,11 @@
 A multi-language, cross-platform IDE with a Visual Studio-style workflow, written in Rust.
 *Kalem* is Turkish for "pen".
 
-> **Status: very early.** Today this repository contains the project skeleton: a command
-> registry, language-pack loading and a small CLI. The editor UI, LSP client and debugger
-> UI are on the [roadmap](docs/ROADMAP.md).
+![Kalem IDE with a Rust file open, Solution Explorer on the right and the Output panel below](docs/screenshot.png)
+
+> **Status: early.** The desktop IDE works today (editor, Solution Explorer, Git Changes,
+> build / run / test, language servers and debugging); see
+> [Running](docs/RUNNING.md). What comes next is on the [roadmap](docs/ROADMAP.md).
 
 ## Goals
 
